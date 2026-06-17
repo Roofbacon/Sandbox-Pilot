@@ -9,11 +9,11 @@ import { fileURLToPath } from "node:url";
 const here = path.dirname(fileURLToPath(import.meta.url));
 
 /**
- * The bridge folder is the mapped host<->guest folder (`.../windows-sandbox-ai-control/bridge`).
- * Resolved from SANDBOX_BRIDGE_ROOT, else relative to this compiled file (mcp/dist -> ../../bridge).
+ * The bridge folder is the mapped host<->guest folder. Resolved from SANDBOX_BRIDGE_ROOT,
+ * else relative to this compiled file: dist/ is at the package root, so bridge is ../bridge.
  */
 export const bridgeRoot = path.resolve(
-  process.env.SANDBOX_BRIDGE_ROOT ?? path.join(here, "..", "..", "bridge"),
+  process.env.SANDBOX_BRIDGE_ROOT ?? path.join(here, "..", "bridge"),
 );
 export const projectRoot = path.resolve(bridgeRoot, "..");
 const commandsDir = path.join(bridgeRoot, "commands");

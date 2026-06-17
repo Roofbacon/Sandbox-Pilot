@@ -9,7 +9,6 @@ param([switch]$BundleTesseract)
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
-$mcp = Join-Path $root 'mcp'
 
 Write-Host '== Sandbox Pilot setup ==' -ForegroundColor Cyan
 
@@ -28,8 +27,8 @@ if (-not (Get-Command wsb -ErrorAction SilentlyContinue)) {
 
 # 3. Install + build (the package "prepare" script runs tsc, so this also builds dist).
 Write-Host 'Installing dependencies and building the MCP server...'
-& npm install --prefix $mcp
-$dist = Join-Path $mcp 'dist\index.js'
+& npm install --prefix $root
+$dist = Join-Path $root 'dist\index.js'
 if (-not (Test-Path $dist)) {
     Write-Host 'Build did not produce dist/index.js. Check the npm output above.' -ForegroundColor Red
     exit 1

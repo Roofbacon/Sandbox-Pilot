@@ -1,6 +1,6 @@
 # Node
-mcp/node_modules/
-mcp/dist/
+node_modules/
+dist/
 *.tsbuildinfo
 npm-debug.log*
 

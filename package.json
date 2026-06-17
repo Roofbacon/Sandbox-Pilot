@@ -7,7 +7,27 @@
     "sandbox-pilot": "dist/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "host",
+    "guest",
+    "bridge/BootstrapWinget.ps1",
+    "bridge/CheckAdobeStatus.ps1",
+    "bridge/InstallTesseract.ps1",
+    "bridge/KillPowerShellProcesses.cmd",
+    "bridge/ListProcesses.cmd"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Roofbacon/Sandbox-Pilot.git"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "windows-sandbox",
+    "automation",
+    "ui-automation",
+    "ocr"
   ],
   "scripts": {
     "build": "tsc",

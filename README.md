@@ -40,9 +40,9 @@ flowchart LR
 
 - **Host** ([`host/SandboxBridge.ps1`](host/SandboxBridge.ps1)) manages the Sandbox lifecycle via the `wsb` CLI and a small mapped folder.
 - **Guest agent** ([`guest/SandboxAgent.ps1`](guest/SandboxAgent.ps1)) runs inside the Sandbox, listens on a TCP socket, and executes commands using UI Automation, `System.Drawing` (capture), and Win32 input.
-- **MCP server** ([`mcp/`](mcp/)) translates MCP tool calls into agent commands. The guest connects *out* to the host (no host firewall changes needed) and authenticates with a per-session token.
+- **MCP server** ([`src/`](src/), built to `dist/`) translates MCP tool calls into agent commands. The guest connects *out* to the host (no host firewall changes needed) and authenticates with a per-session token.
 
-See [`mcp/README.md`](mcp/README.md) for the deep technical reference (transports, latency numbers, internals).
+See [`docs/SERVER.md`](docs/SERVER.md) for the deep technical reference (transports, latency numbers, internals).
 
 ## Requirements
 
@@ -59,41 +59,59 @@ Enable-WindowsOptionalFeature -FeatureName "Containers-DisposableClientVM" -All 
 
 ## Install
 
-One command — checks Node + Windows Sandbox, installs & builds the server, and prints the exact MCP client config to paste:
+### A) Add it to your MCP client with `npx` (no clone)
+
+`npx` fetches, builds, and runs Sandbox Pilot straight from GitHub — so adding it is one line.
+
+**Claude Code:**
+
+```powershell
+claude mcp add sandbox-pilot --env SANDBOX_TRANSPORT=socket -- npx -y github:Roofbacon/Sandbox-Pilot
+```
+
+**Claude Desktop / other config-based clients** — add to the `mcpServers` config:
+
+```json
+{
+  "mcpServers": {
+    "sandbox-pilot": {
+      "command": "npx",
+      "args": ["-y", "github:Roofbacon/Sandbox-Pilot"],
+      "env": { "SANDBOX_TRANSPORT": "socket" }
+    }
+  }
+}
+```
+
+**Codex** (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.sandbox-pilot]
+command = "npx"
+args = ["-y", "github:Roofbacon/Sandbox-Pilot"]
+env = { SANDBOX_TRANSPORT = "socket" }
+```
+
+Requires **Node 18+ and Git** on PATH. The first launch clones + builds (~30–60 s, then cached). Runtime files and the optional Tesseract bundle live under npm's npx cache; pin them elsewhere with `SANDBOX_BRIDGE_ROOT` if you prefer.
+
+### B) Clone and run locally (best for development)
 
 ```powershell
 git clone https://github.com/Roofbacon/Sandbox-Pilot.git
 cd Sandbox-Pilot
-.\setup.ps1
+.\setup.ps1     # checks prereqs, installs + builds (npm install auto-builds), prints your client config
 ```
 
-Prefer to do it by hand? `npm install` builds automatically (via the package's `prepare` script — no separate build step):
-
-```powershell
-cd Sandbox-Pilot\mcp
-npm install
-```
+`setup.ps1` prints a `node <abs path>\dist\index.js` config you can paste instead of the npx one.
 
 ## Quick start
 
-1. **Bring up a control-ready Sandbox** (starts/reuses one, opens the interactive session, sets DNS, launches the guest agent over the socket):
+1. **Add the server** to your client (see **Install** above) and restart the client.
+
+2. **Bring up a control-ready Sandbox** — either ask the agent to call the `sandbox_prepare` tool (first cold boot takes ~1–2 min), or, with a local clone, run it yourself:
 
    ```powershell
    .\host\SandboxBridge.ps1 prepare-socket
-   ```
-
-2. **Point your MCP client at the server.** Example client config:
-
-   ```json
-   {
-     "mcpServers": {
-       "sandbox-pilot": {
-         "command": "node",
-         "args": ["C:/Users/you/Git/Sandbox-Pilot/mcp/dist/index.js"],
-         "env": { "SANDBOX_TRANSPORT": "socket" }
-       }
-     }
-   }
    ```
 
 3. **Use it.** A typical agent loop:
@@ -131,7 +149,7 @@ This downloads Tesseract on the host, installs it inside the Sandbox (elevated, 
 ## Development
 
 ```powershell
-cd mcp
+npm install     # installs + builds (prepare runs tsc)
 npm test        # offline unit/integration tests (no Sandbox needed)
 node smoke.mjs  # end-to-end smoke test against a running Sandbox (set SANDBOX_TRANSPORT=socket)
 ```
@@ -161,11 +179,15 @@ After editing the guest agent, redeploy to a running Sandbox in one command:
 
 ```
 Sandbox-Pilot/
+├─ src/               # the MCP server (TypeScript) — builds to dist/
+├─ test/              # offline unit/integration tests
 ├─ host/              # SandboxBridge.ps1 (lifecycle + CLI), AnnotateScreenshot.ps1
 ├─ guest/             # SandboxAgent.ps1 — the in-Sandbox agent (source of truth)
 ├─ bridge/            # mapped host<->guest folder: source helpers (+ runtime files, gitignored)
-├─ mcp/               # the MCP server (TypeScript), tests, smoke test
-└─ examples/          # a generated guide (Windows display-language change)
+├─ examples/          # a generated guide (Windows display-language change)
+├─ docs/SERVER.md     # detailed server/transport reference
+├─ package.json       # bin: sandbox-pilot -> dist/index.js
+└─ setup.ps1          # one-command local setup
 ```
 
 ## License

@@ -42,21 +42,22 @@ to a screenshot and use `sandbox_annotate` in `image` mode.
 
 ## Client configuration
 
-Add to your MCP client (e.g. Claude Code / Codex) config:
+Add to your MCP client (e.g. Claude Code / Codex). The simplest is `npx` (see the top-level
+README), or a local build:
 
 ```json
 {
   "mcpServers": {
-    "windows-sandbox": {
+    "sandbox-pilot": {
       "command": "node",
-      "args": ["C:/Users/KEOH/Documents/Codex/2026-06-16/does-a-mcp-tool-exist-to/outputs/windows-sandbox-ai-control/mcp/dist/index.js"],
+      "args": ["C:/Users/you/Git/Sandbox-Pilot/dist/index.js"],
       "env": { "SANDBOX_TRANSPORT": "socket" }
     }
   }
 }
 ```
 
-The server resolves the bridge folder from `SANDBOX_BRIDGE_ROOT` (defaults to `../../bridge`
+The server resolves the bridge folder from `SANDBOX_BRIDGE_ROOT` (defaults to `../bridge`
 relative to `dist/`). Set it explicitly if you relocate the server.
 
 ## Tests
@@ -116,7 +117,7 @@ Start it (the `sandbox_prepare` tool does this for you when the server runs with
 # manual equivalent, from the project root:
 .\host\SandboxBridge.ps1 prepare-socket      # reuse/start + connect + DNS + start socket agent + await endpoint
 # (or just .\host\SandboxBridge.ps1 attach-socket if a prepared Sandbox is already running)
-$env:SANDBOX_TRANSPORT = "socket"; node mcp/dist/index.js
+$env:SANDBOX_TRANSPORT = "socket"; node dist/index.js
 ```
 
 ### `file` (default, simple but slow)
