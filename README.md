@@ -32,7 +32,7 @@ Sandbox Pilot exposes [Windows Sandbox](https://learn.microsoft.com/en-us/window
 | **Diagnostics** | `sandbox_event_logs` - collect Application/System event-log entries (Critical/Error/Warning + MsiInstaller) for a time window; `sandbox_test_install_command` also captures them around the install window |
 | **Intune packaging** | `sandbox_intune_prereqs`, `sandbox_intune_package_win32`, `sandbox_intune_package_from_host` - test install, verify detection, test uninstall, auto-install Microsoft's Win32 Content Prep Tool if needed, and save `.intunewin` packages to shared artifacts |
 | **Long jobs** | `sandbox_start_job`, `sandbox_job_status`, `sandbox_job_cancel` - run long PowerShell operations without blocking the MCP call, with persisted stdout/stderr artifacts |
-| **Document** | `sandbox_annotate` (boxes/arrows/labels/spotlight), `sandbox_guide_step` + `sandbox_guide_build` + `sandbox_guide_reset` |
+| **Document** | `sandbox_annotate` (boxes/arrows/labels/spotlight/**redact**), `sandbox_record_start` + `sandbox_record_stop` (auto-capture a step per action), `sandbox_guide_step` + `sandbox_guide_build` (Markdown/HTML/PDF) + `sandbox_guide_reset` |
 | **Lifecycle** | `sandbox_prepare` (one call to a control-ready Sandbox; `fresh=true` to force a clean boot), `sandbox_stop` (reset — destroy the VM), `sandbox_status` |
 
 > **Reset semantics.** `wsb` runs the Sandbox VM detached, so closing the interactive window only closes the *viewer* — the VM (and all its guest state) keeps running. `sandbox_prepare` reuses a running Sandbox by default (no ~60s boot), which means state persists between sessions. Call `sandbox_stop` (or `sandbox_prepare` with `fresh=true`) to actually destroy the VM and start clean. The guest desktop is also pinned to a clean **1920×1080** on prepare, since the RDP session otherwise boots at a tiny or microscopic resolution.
@@ -189,6 +189,17 @@ For a normal host folder, prefer `sandbox_intune_package_from_host`. It stages t
 Use `sandbox_intune_package_win32` after you have a source folder, setup file, and install/uninstall commands. By default it runs install, detection, uninstall, and detection-absent checks first, and skips package creation if any concrete check fails. Pass `testInstall: false`, `verifyDetection: false`, or `testUninstall: false` only when intentionally bypassing that validation. If `IntuneWinAppUtil.exe` is missing, the tool can download the official Microsoft Win32 Content Prep Tool into `C:\SandboxBridge\tools`, keeping it outside the package source folder.
 
 Generated `.intunewin` files are written to `C:\SandboxBridge\artifacts\intune` by default and returned with host paths under `bridge\artifacts\intune`, so the user can pick them up directly. The result also includes install-test, detection, uninstall-test, and detection-absent results, packaging stdout/stderr, the Intune install/uninstall command summary, an MSI product-code detection suggestion when applicable, and standard return-code recommendations.
+
+## Guides & documentation
+
+There are two ways to build a step-by-step guide:
+
+- **Manual** — call `sandbox_guide_step` at each point you want captured, with your own caption and optional annotations.
+- **Auto-record** — call `sandbox_record_start` with a guide name, then just drive the task. Every action (`sandbox_open` / `_click` / `_double_click` / `_invoke` / `_type` / `_key`) appends a captioned screenshot step, with the caption derived from the action (e.g. *Click "Add device"*, *Type "..."*) and, by default, an arrow/box marking the target. Call `sandbox_record_stop` when done. Drive it once, get the walkthrough for free.
+
+`sandbox_guide_build` then assembles the steps into one or more documents — `markdown` (default), self-contained `html` (images embedded as base64, opens anywhere), and/or `pdf` — via the `formats` parameter.
+
+**Redaction.** The annotation pipeline (`sandbox_annotate`, and the `shapes` of a guide step) supports a `redact` shape that blacks out or pixelates a region (`{ type: "redact", rect: [x,y,w,h], pixelate?: true }`) — use it to mask usernames, tokens, or machine names before a guide leaves your hands.
 
 ## Transports
 

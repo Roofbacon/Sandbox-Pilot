@@ -2510,14 +2510,20 @@ function Invoke-AgentCommand {
             }
             $info = $el.Current
             $performed = Invoke-UiElement -Element $el -Action $action -Value $value -FallbackClick $fallbackClick
-            return @{ data = @{
-                    invoked = $true
-                    action = $performed
-                    matchCount = $found.Count
-                    name = [string]$info.Name
-                    automationId = [string]$info.AutomationId
-                    controlType = ($info.ControlType.ProgrammaticName -replace '^ControlType\.', '')
-                } }
+            $data = @{
+                invoked = $true
+                action = $performed
+                matchCount = $found.Count
+                name = [string]$info.Name
+                automationId = [string]$info.AutomationId
+                controlType = ($info.ControlType.ProgrammaticName -replace '^ControlType\.', '')
+            }
+            $r = $info.BoundingRectangle
+            if (-not [double]::IsInfinity($r.X) -and $r.Width -gt 0 -and $r.Height -gt 0) {
+                $data.rect = @([int]$r.X, [int]$r.Y, [int]$r.Width, [int]$r.Height)
+                $data.click = @([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))
+            }
+            return @{ data = $data }
         }
         "wait_for" {
             $scope = [string](Get-ArgValue $args "scope" "window")

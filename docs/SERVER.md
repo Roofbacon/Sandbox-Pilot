@@ -47,8 +47,9 @@ Or use the repo-root helper, which also prints your MCP client config: `..\setup
 | `sandbox_intune_prereqs` | Find or download Microsoft's IntuneWinAppUtil.exe into the shared `tools` folder and report version/source information. |
 | `sandbox_intune_package_win32` | Test install, verify detection, test uninstall, verify detection absence, then run IntuneWinAppUtil.exe to create a `.intunewin` package under shared `artifacts/intune`, with host paths and deployment metadata suggestions. |
 | `sandbox_center_window` | Center the foreground window for clean screenshots. |
-| `sandbox_annotate` | Draw boxes/arrows/labels/spotlight on a screenshot (screen or image coords; screen mode is capture-offset aware, so window/region shots annotate correctly). |
-| `sandbox_guide_step` / `sandbox_guide_build` / `sandbox_guide_reset` | Record captioned (optionally annotated) screenshot steps into a named guide, then assemble them into a Markdown document with embedded images. |
+| `sandbox_annotate` | Draw boxes/arrows/labels/spotlight/redact on a screenshot (screen or image coords; screen mode is capture-offset aware, so window/region shots annotate correctly). `redact` solid-fills or pixelates a region for masking sensitive data. |
+| `sandbox_record_start` / `sandbox_record_stop` | Auto-record a guide: while active, each action (open/click/double_click/invoke/type/key) appends a captioned, target-annotated screenshot step to the named guide. |
+| `sandbox_guide_step` / `sandbox_guide_build` / `sandbox_guide_reset` | Record captioned (optionally annotated) screenshot steps into a named guide, then assemble them into Markdown, self-contained HTML, and/or PDF documents with embedded images. |
 
 Sensing guidance baked into the tool descriptions: prefer `sandbox_ui_tree` for "what's on
 screen / where to click" (cheap, exact coordinates); use `sandbox_screenshot` for visual

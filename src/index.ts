@@ -9,6 +9,7 @@ import * as fileBridge from "./bridge.js";
 import * as socketBridge from "./socket-bridge.js";
 import { runTestPlan } from "./testplan.js";
 import { diffSnapshots } from "./snapshot.js";
+import { buildGuideDocs } from "./guidedoc.js";
 
 // Transport: "socket" (low latency, guest listens / host connects out) or the default
 // file bridge (shared folder; simpler but ~20s host->guest propagation).
@@ -73,6 +74,83 @@ async function copyPackagesToHostFolder(packages: any[], outputHostFolder: strin
     copied.push({ ...pkg, hostPath: destination });
   }
   return copied;
+}
+
+// ---- Guide steps & auto-record -------------------------------------------
+// Shared by sandbox_guide_step (manual) and the recorder (automatic). When a recording is active,
+// the action tools (open/click/invoke/type/key) capture a captioned, optionally annotated step.
+
+type ShapeInput = z.infer<typeof shapeSchema>;
+
+const guidesDir = path.join(bridgeRoot, "guides");
+const guideDirFor = (name: string) => path.join(guidesDir, name.replace(/[^a-z0-9_-]/gi, "_"));
+
+async function readSteps(dir: string): Promise<any[]> {
+  try {
+    return JSON.parse(await fsp.readFile(path.join(dir, "steps.json"), "utf8"));
+  } catch {
+    return [];
+  }
+}
+
+async function addGuideStep(opts: {
+  guide: string;
+  caption: string;
+  window?: boolean;
+  region?: number[];
+  shapes?: ShapeInput[];
+}): Promise<{ guide: string; step: number; image: string; totalSteps: number }> {
+  const dir = guideDirFor(opts.guide);
+  await fsp.mkdir(dir, { recursive: true });
+  const steps = await readSteps(dir);
+  const n = steps.length + 1;
+  const nn = String(n).padStart(2, "0");
+
+  const shot = await screenshot({ window: opts.window, region: opts.region });
+  const rawPath = path.join(dir, `step-${nn}-raw.jpg`);
+  await fsp.writeFile(rawPath, Buffer.from(shot.base64, "base64"));
+
+  let image = `step-${nn}-raw.jpg`;
+  if (opts.shapes && opts.shapes.length) {
+    const outPath = path.join(dir, `step-${nn}.jpg`);
+    await annotate({ inputPath: rawPath, outputPath: outPath, shapes: opts.shapes, mode: "screen", metadataPath: shot.metadataPath });
+    image = `step-${nn}.jpg`;
+  }
+
+  steps.push({ n, caption: opts.caption, image });
+  await fsp.writeFile(path.join(dir, "steps.json"), JSON.stringify(steps, null, 2), "utf8");
+  return { guide: opts.guide, step: n, image, totalSteps: steps.length };
+}
+
+// Active auto-record session, or null. window/annotate are captured at record-start.
+let activeRecording: { guide: string; window: boolean; annotate: boolean } | null = null;
+
+// Called by action tools after a successful action. Captures a step when recording; never throws.
+async function autoRecord(caption: string, shapes?: ShapeInput[]): Promise<void> {
+  if (!activeRecording) return;
+  try {
+    await addGuideStep({
+      guide: activeRecording.guide,
+      caption,
+      window: activeRecording.window,
+      shapes: activeRecording.annotate ? shapes : undefined,
+    });
+  } catch (err) {
+    console.error("[sandbox-pilot] auto-record step failed:", err);
+  }
+}
+
+// An arrow pointing at a screen coordinate, for click/double-click auto-annotation.
+function arrowAt(x: number, y: number): ShapeInput[] {
+  return [{ type: "arrow", from: [x - 60, y - 60], to: [x, y] } as ShapeInput];
+}
+
+// A box around an actuated element's rect (from invoke result data), if present.
+function boxFor(data: any): ShapeInput[] | undefined {
+  if (Array.isArray(data?.rect) && data.rect.length === 4) {
+    return [{ type: "box", rect: data.rect } as ShapeInput];
+  }
+  return undefined;
 }
 
 // ---- Sensing -------------------------------------------------------------
@@ -160,7 +238,20 @@ server.registerTool(
   },
   async (args) => {
     if (!args.name && !args.automationId) throw new Error("sandbox_invoke requires 'name' and/or 'automationId'.");
-    return text((await sendCommand("invoke", args, 30000)).data);
+    const data = (await sendCommand("invoke", args, 30000)).data;
+    if (activeRecording) {
+      const label = args.name || args.automationId || "element";
+      const performed = data?.action ?? args.action;
+      const caption =
+        performed === "setvalue" || args.value != null ? `Set "${label}" to "${args.value ?? ""}"`
+        : performed === "toggle" ? `Toggle "${label}"`
+        : performed === "select" ? `Select "${label}"`
+        : performed === "expand" ? `Expand "${label}"`
+        : performed === "collapse" ? `Collapse "${label}"`
+        : `Click "${label}"`;
+      await autoRecord(caption, boxFor(data));
+    }
+    return text(data);
   },
 );
 
@@ -225,7 +316,11 @@ server.registerTool(
       button: z.enum(["left", "right", "middle"]).default("left"),
     },
   },
-  async ({ x, y, button }) => text((await sendCommand("click", { x, y, button }, 30000)).data),
+  async ({ x, y, button }) => {
+    const data = (await sendCommand("click", { x, y, button }, 30000)).data;
+    await autoRecord(`${button === "left" ? "Click" : `${button}-click`} at (${x}, ${y})`, arrowAt(x, y));
+    return text(data);
+  },
 );
 
 server.registerTool(
@@ -235,7 +330,11 @@ server.registerTool(
     description: "Double-click at an absolute screen coordinate (real pixels).",
     inputSchema: { x: z.number().int(), y: z.number().int() },
   },
-  async ({ x, y }) => text((await sendCommand("double_click", { x, y }, 30000)).data),
+  async ({ x, y }) => {
+    const data = (await sendCommand("double_click", { x, y }, 30000)).data;
+    await autoRecord(`Double-click at (${x}, ${y})`, arrowAt(x, y));
+    return text(data);
+  },
 );
 
 server.registerTool(
@@ -276,7 +375,11 @@ server.registerTool(
     description: "Type text into the focused control (System.Windows.Forms.SendKeys). The right window/control must be focused first.",
     inputSchema: { text: z.string() },
   },
-  async ({ text: t }) => text((await sendCommand("type", { text: t }, 30000)).data),
+  async ({ text: t }) => {
+    const data = (await sendCommand("type", { text: t }, 30000)).data;
+    await autoRecord(`Type "${t}"`);
+    return text(data);
+  },
 );
 
 server.registerTool(
@@ -286,7 +389,11 @@ server.registerTool(
     description: "Send keystrokes in SendKeys syntax, e.g. {ENTER}, {ESC}, {TAB}, ^a (Ctrl+A), %{F4} (Alt+F4).",
     inputSchema: { keys: z.string().describe("SendKeys syntax.") },
   },
-  async ({ keys }) => text((await sendCommand("key", { keys }, 30000)).data),
+  async ({ keys }) => {
+    const data = (await sendCommand("key", { keys }, 30000)).data;
+    await autoRecord(`Press ${keys}`);
+    return text(data);
+  },
 );
 
 server.registerTool(
@@ -302,7 +409,11 @@ server.registerTool(
       "`windows` lists the visible top-level window titles. A null `warning` means the launch looked clean.",
     inputSchema: { target: z.string().describe("Executable, file path, or URI.") },
   },
-  async ({ target }) => text((await sendCommand("open", { target }, 30000)).data),
+  async ({ target }) => {
+    const data = (await sendCommand("open", { target }, 30000)).data;
+    await autoRecord(`Open ${target}`);
+    return text(data);
+  },
 );
 
 server.registerTool(
@@ -849,8 +960,10 @@ server.registerTool(
 
 const shapeSchema = z
   .object({
-    type: z.enum(["box", "arrow", "label", "spotlight"]),
-    rect: z.array(z.number()).length(4).optional().describe("[x,y,w,h] for box/spotlight."),
+    type: z.enum(["box", "arrow", "label", "spotlight", "redact"]),
+    rect: z.array(z.number()).length(4).optional().describe("[x,y,w,h] for box/spotlight/redact."),
+    pixelate: z.boolean().optional().describe("redact: pixelate the region instead of a solid fill."),
+    blocks: z.number().optional().describe("redact+pixelate: horizontal block count (coarseness; default 8)."),
     from: z.array(z.number()).length(2).optional().describe("[x,y] arrow start."),
     to: z.array(z.number()).length(2).optional().describe("[x,y] arrow tip."),
     at: z.array(z.number()).length(2).optional().describe("[x,y] label top-left."),
@@ -868,7 +981,7 @@ server.registerTool(
   {
     title: "Annotate a screenshot",
     description:
-      "Draw boxes / arrows / labels / spotlight onto a previously captured screenshot and return the " +
+      "Draw boxes / arrows / labels / spotlight / redact onto a previously captured screenshot and return the " +
       "annotated image inline. mode='screen' takes coordinates in real screen pixels (pair with " +
       "sandbox_ui_tree rects) and maps them via the capture metadata. mode='image' takes coordinates " +
       "in the screenshot's own pixels (read straight off the JPEG) — use this for apps with no UI tree.",
@@ -969,55 +1082,63 @@ server.registerTool(
 );
 
 // ---- Guide builder -------------------------------------------------------
-
-const guidesDir = path.join(bridgeRoot, "guides");
-const guideDirFor = (name: string) => path.join(guidesDir, name.replace(/[^a-z0-9_-]/gi, "_"));
-
-async function readSteps(dir: string): Promise<any[]> {
-  try {
-    return JSON.parse(await fsp.readFile(path.join(dir, "steps.json"), "utf8"));
-  } catch {
-    return [];
-  }
-}
+// guidesDir / guideDirFor / readSteps / addGuideStep live near the top (shared with auto-record).
 
 server.registerTool(
   "sandbox_guide_step",
   {
     title: "Record a guide step",
     description:
-      "Capture a screenshot, optionally annotate it (boxes/arrows/labels in real screen coords), " +
+      "Capture a screenshot, optionally annotate it (boxes/arrows/labels/redact in real screen coords), " +
       "and append it as a numbered step with a caption to a named guide. Build the final document " +
-      "with sandbox_guide_build. Use window/region to focus the shot on the relevant UI.",
+      "with sandbox_guide_build. Use window/region to focus the shot on the relevant UI. For hands-off " +
+      "capture, use sandbox_record_start to auto-append a step after every action instead.",
     inputSchema: {
       guide: z.string().describe("Guide name (a folder under bridge/guides)."),
       caption: z.string().describe("Instruction text shown above this step's screenshot."),
       window: z.boolean().optional().describe("Capture only the foreground window."),
       region: z.array(z.number()).length(4).optional().describe("[x,y,w,h] real-screen crop."),
-      shapes: z.array(shapeSchema).optional().describe("Optional annotations (screen-coord boxes/arrows/labels)."),
+      shapes: z.array(shapeSchema).optional().describe("Optional annotations (screen-coord boxes/arrows/labels/redact)."),
     },
   },
-  async ({ guide, caption, window, region, shapes }) => {
-    const dir = guideDirFor(guide);
-    await fsp.mkdir(dir, { recursive: true });
-    const steps = await readSteps(dir);
-    const n = steps.length + 1;
-    const nn = String(n).padStart(2, "0");
+  async ({ guide, caption, window, region, shapes }) => text(await addGuideStep({ guide, caption, window, region, shapes })),
+);
 
-    const shot = await screenshot({ window, region });
-    const rawPath = path.join(dir, `step-${nn}-raw.jpg`);
-    await fsp.writeFile(rawPath, Buffer.from(shot.base64, "base64"));
+server.registerTool(
+  "sandbox_record_start",
+  {
+    title: "Start auto-recording a guide",
+    description:
+      "Begin capturing a guide automatically: after this, each action (sandbox_open / _click / " +
+      "_double_click / _invoke / _type / _key) appends a captioned screenshot step to the named guide, " +
+      "with the caption derived from the action and (by default) an annotation marking the target. Drive " +
+      "the task once and get the walkthrough for free. Call sandbox_record_stop when done, then " +
+      "sandbox_guide_build. Only one recording is active at a time.",
+    inputSchema: {
+      guide: z.string().describe("Guide name to append auto-captured steps to."),
+      window: z.boolean().default(false).describe("Capture only the foreground window for each step."),
+      annotate: z.boolean().default(true).describe("Draw an arrow/box on the action target in each captured step."),
+    },
+  },
+  async ({ guide, window, annotate: annotateOn }) => {
+    activeRecording = { guide, window, annotate: annotateOn };
+    return text({ recording: true, guide, window, annotate: annotateOn });
+  },
+);
 
-    let image = `step-${nn}-raw.jpg`;
-    if (shapes && shapes.length) {
-      const outPath = path.join(dir, `step-${nn}.jpg`);
-      await annotate({ inputPath: rawPath, outputPath: outPath, shapes, mode: "screen", metadataPath: shot.metadataPath });
-      image = `step-${nn}.jpg`;
-    }
-
-    steps.push({ n, caption, image });
-    await fsp.writeFile(path.join(dir, "steps.json"), JSON.stringify(steps, null, 2), "utf8");
-    return text({ guide, step: n, image, totalSteps: steps.length });
+server.registerTool(
+  "sandbox_record_stop",
+  {
+    title: "Stop auto-recording",
+    description: "Stop the active guide recording. Returns the guide name and how many steps it now has. Build the document with sandbox_guide_build.",
+    inputSchema: {},
+  },
+  async () => {
+    if (!activeRecording) return text({ recording: false, message: "No recording was active." });
+    const guide = activeRecording.guide;
+    activeRecording = null;
+    const steps = await readSteps(guideDirFor(guide));
+    return text({ recording: false, guide, totalSteps: steps.length });
   },
 );
 
@@ -1025,23 +1146,25 @@ server.registerTool(
   "sandbox_guide_build",
   {
     title: "Build the guide document",
-    description: "Assemble the recorded steps of a named guide into a Markdown file with embedded screenshots.",
+    description:
+      "Assemble the recorded steps of a named guide into one or more documents with embedded screenshots: " +
+      "Markdown (default), self-contained HTML (base64-embedded images), and/or PDF. Returns the host path " +
+      "of each generated file.",
     inputSchema: {
       guide: z.string(),
       title: z.string().optional().describe("Document title (defaults to the guide name)."),
+      formats: z
+        .array(z.enum(["markdown", "html", "pdf"]))
+        .optional()
+        .describe("Output formats to produce (default ['markdown'])."),
     },
   },
-  async ({ guide, title }) => {
+  async ({ guide, title, formats }) => {
     const dir = guideDirFor(guide);
     const steps = await readSteps(dir);
-    if (!steps.length) throw new Error(`No steps recorded for guide '${guide}'. Use sandbox_guide_step first.`);
-    let md = `# ${title ?? guide}\n\n`;
-    for (const s of steps) {
-      md += `## Step ${s.n}\n\n${s.caption}\n\n![Step ${s.n}](${s.image})\n\n`;
-    }
-    const mdPath = path.join(dir, `${path.basename(dir)}.md`);
-    await fsp.writeFile(mdPath, md, "utf8");
-    return text({ guide, mdPath, steps: steps.length });
+    if (!steps.length) throw new Error(`No steps recorded for guide '${guide}'. Use sandbox_guide_step or sandbox_record_start first.`);
+    const outputs = await buildGuideDocs({ title: title ?? guide, steps: steps as any, dir, formats: formats ?? ["markdown"] });
+    return text({ guide, steps: steps.length, outputs });
   },
 );
 

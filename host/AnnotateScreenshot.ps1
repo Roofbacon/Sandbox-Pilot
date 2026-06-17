@@ -102,6 +102,32 @@ foreach ($s in $shapes) {
             $fgBrush.Dispose()
             $font.Dispose()
         }
+        "redact" {
+            $rx = PX $s.rect[0]; $ry = PY $s.rect[1]; $rw = PSize $s.rect[2]; $rh = PSize $s.rect[3]
+            $pixelate = ($null -ne $s.pixelate -and [bool]$s.pixelate)
+            if ($pixelate -and $rw -ge 4 -and $rh -ge 4) {
+                # Pixelate: copy the region, shrink to a few blocks, draw it back scaled up (blocky).
+                $blocks = if ($null -ne $s.blocks) { [int]$s.blocks } else { 8 }
+                $smallW = [Math]::Max(1, $blocks)
+                $smallH = [Math]::Max(1, [int]($rh / $rw * $blocks))
+                $region = New-Object System.Drawing.Bitmap([int]$rw, [int]$rh)
+                $rg = [System.Drawing.Graphics]::FromImage($region)
+                $rg.DrawImage($bmp, (New-Object System.Drawing.Rectangle(0, 0, [int]$rw, [int]$rh)), [int]$rx, [int]$ry, [int]$rw, [int]$rh, [System.Drawing.GraphicsUnit]::Pixel)
+                $rg.Dispose()
+                $small = New-Object System.Drawing.Bitmap($region, (New-Object System.Drawing.Size($smallW, $smallH)))
+                $prevInterp = $g.InterpolationMode
+                $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::NearestNeighbor
+                $g.DrawImage($small, $rx, $ry, $rw, $rh)
+                $g.InterpolationMode = $prevInterp
+                $small.Dispose(); $region.Dispose()
+            }
+            else {
+                $fill = Resolve-Color $s.color ([System.Drawing.Color]::Black)
+                $brush = New-Object System.Drawing.SolidBrush($fill)
+                $g.FillRectangle($brush, $rx, $ry, $rw, $rh)
+                $brush.Dispose()
+            }
+        }
         "spotlight" {
             $alpha = if ($null -ne $s.dim) { [int]$s.dim } else { 120 }
             $overlay = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb($alpha, 0, 0, 0))
