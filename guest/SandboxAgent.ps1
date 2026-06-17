@@ -867,8 +867,63 @@ function Invoke-AgentCommand {
             return @{ data = @{ sent = [string]$args.keys } }
         }
         "open" {
-            Start-Process -FilePath ([string]$args.target)
-            return @{ data = @{ opened = [string]$args.target } }
+            $target = [string]$args.target
+            Start-Process -FilePath $target
+
+            # After launching, poll top-level windows for a shell error / app-picker dialog
+            # ("We can't open this ... link", "How do you want to open this file?", "No apps are
+            # installed", ...) so the caller learns immediately when the target did NOT open the
+            # expected app (e.g. a UWP app that isn't present in the Sandbox). These dialogs can
+            # take a second or two to appear, so poll rather than checking once.
+            $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+            $pattern = "can.t open|How do you want to open|Pick an app|No apps( are)? installed|does not have an app associated"
+            $warning = $null
+            $windows = @()
+            $deadline = (Get-Date).AddSeconds(3.5)
+            while ((Get-Date) -lt $deadline -and -not $warning) {
+                Start-Sleep -Milliseconds 400
+                $found = New-Object System.Collections.ArrayList
+                try {
+                    $w = $walker.GetFirstChild([System.Windows.Automation.AutomationElement]::RootElement)
+                    $seenWin = 0
+                    while ($w -and $seenWin -lt 40 -and -not $warning) {
+                        $seenWin++
+                        $wn = ""
+                        try { $wn = [string]$w.Current.Name } catch { }
+                        if ($wn) { [void]$found.Add($wn) }
+                        # Only inspect real dialog/app Windows — not the desktop/taskbar Panes
+                        # (whose running-app buttons would otherwise false-match).
+                        $ct = ""
+                        try { $ct = [string]$w.Current.ControlType.ProgrammaticName } catch { }
+                        if ($ct -eq "ControlType.Window") {
+                            # depth-limited text scan of this window to catch the dialog message
+                            $text = $wn
+                            $stack = New-Object System.Collections.Stack
+                            $stack.Push([pscustomobject]@{ el = $w; depth = 0 })
+                            $nodes = 0
+                            while ($stack.Count -gt 0 -and $nodes -lt 50) {
+                                $fr = $stack.Pop(); $nodes++
+                                try { $en = [string]$fr.el.Current.Name; if ($en) { $text += " | " + $en } } catch { }
+                                if ($fr.depth -lt 3) {
+                                    try {
+                                        $ch = $walker.GetFirstChild($fr.el)
+                                        while ($ch) { $stack.Push([pscustomobject]@{ el = $ch; depth = ($fr.depth + 1) }); $ch = $walker.GetNextSibling($ch) }
+                                    }
+                                    catch { }
+                                }
+                            }
+                            if ($text -match $pattern) {
+                                $warning = (($text -replace '\s+', ' ').Trim())
+                                if ($warning.Length -gt 220) { $warning = $warning.Substring(0, 220) }
+                            }
+                        }
+                        $w = $walker.GetNextSibling($w)
+                    }
+                }
+                catch { }
+                $windows = @($found)
+            }
+            return @{ data = @{ opened = $target; windows = @($windows); warning = $warning } }
         }
         "run_ps" {
             $output = Invoke-Expression ([string]$args.command) *>&1 | Out-String

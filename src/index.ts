@@ -241,7 +241,13 @@ server.registerTool(
   "sandbox_open",
   {
     title: "Open an app, file, or URL",
-    description: "Launch an executable, file path, or URI (including ms-settings: deep links) inside the Sandbox.",
+    description:
+      "Launch an executable, file path, or URI (including ms-settings: deep links) inside the Sandbox. " +
+      "After launching it briefly watches the top-level windows: if the shell pops a failure / app-picker " +
+      'dialog instead of the expected app ("We can\'t open this … link", "How do you want to open this file?", ' +
+      '"No apps are installed", …) the result carries a non-null `warning` with that dialog\'s text — so you ' +
+      "learn the target did not open (e.g. a UWP app absent from a vanilla Sandbox) without taking a screenshot. " +
+      "`windows` lists the visible top-level window titles. A null `warning` means the launch looked clean.",
     inputSchema: { target: z.string().describe("Executable, file path, or URI.") },
   },
   async ({ target }) => text((await sendCommand("open", { target }, 30000)).data),
