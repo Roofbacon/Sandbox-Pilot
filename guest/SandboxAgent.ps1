@@ -327,13 +327,18 @@ function Get-MsiPropertyMap {
     $view = $null
     try {
         $view = $Database.OpenView('SELECT `Property`,`Value` FROM `Property`')
-        $view.Execute()
+        # [void] the COM call: its return value would otherwise pollute the function output, so the
+        # caller would get @(executeResult, $properties) instead of the hashtable (then .Key throws
+        # under Set-StrictMode 2.0).
+        [void]$view.Execute()
         while ($record = $view.Fetch()) {
             $properties[$record.StringData(1)] = $record.StringData(2)
         }
     }
     finally {
-        if ($view) { $view.Close() }
+        # [void] here too: a bare $view.Close() in finally emits into the function output stream,
+        # turning the return into @($properties, closeResult) - then .Keys fails on the array.
+        if ($view) { [void]$view.Close() }
     }
     return $properties
 }
@@ -347,7 +352,7 @@ function Get-MsiInfo {
         $database = $installer.OpenDatabase($Path, 0)
         $properties = Get-MsiPropertyMap -Database $database
         $publicProperties = @()
-        foreach ($name in @($properties.GetEnumerator() | ForEach-Object { $_.Key } | Sort-Object)) {
+        foreach ($name in @($properties.Keys | Sort-Object)) {
             if ($name -cmatch '^[A-Z0-9_]+$') {
                 $publicProperties += [ordered]@{ name = $name; value = $properties[$name] }
             }
@@ -1138,7 +1143,11 @@ function Get-IntunePackagingMetadata {
                 $suggestedInstall = "msiexec /i " + (ConvertTo-InstallerCommandLiteral ([System.IO.Path]::GetFileName($SetupPath))) + " /qn /norestart"
             }
             if (-not $suggestedUninstall -and $msi.productCode) {
-                $suggestedUninstall = "msiexec /x " + $msi.productCode + " /qn /norestart"
+                # Quote the product code: the command is executed through PowerShell (& { ... }),
+                # which otherwise parses the bare {GUID} as a script block and strips the braces,
+                # leaving msiexec with an invalid product code (it then pops a usage dialog that
+                # /qn cannot suppress).
+                $suggestedUninstall = "msiexec /x " + (ConvertTo-InstallerCommandLiteral $msi.productCode) + " /qn /norestart"
             }
             $detection = [ordered]@{
                 type = "msiProductCode"
