@@ -29,6 +29,7 @@ Sandbox Pilot exposes [Windows Sandbox](https://learn.microsoft.com/en-us/window
 | **Installers** | `sandbox_find_install_candidates`, `sandbox_msi_inspect`, `sandbox_analyze_installers`, `sandbox_test_install_command`, `sandbox_verify_detection_rule` - inspect installer payloads, infer silent commands, verify installs, and prove detection rules in the disposable VM |
 | **Test** | `sandbox_assert` (file/registry/process/service/window/installedProgram/msiProductCode/script pass-fail checks), `sandbox_run_test_plan` - run a declarative step list and emit JUnit XML + a screenshot-embedded Markdown report |
 | **Snapshot / diff** | `sandbox_snapshot`, `sandbox_diff_snapshots` - baseline files/registry/programs/services, then diff before vs after to see exactly what an installer changed (footprint docs + uninstall-residue checks) |
+| **Diagnostics** | `sandbox_event_logs` - collect Application/System event-log entries (Critical/Error/Warning + MsiInstaller) for a time window; `sandbox_test_install_command` also captures them around the install window |
 | **Intune packaging** | `sandbox_intune_prereqs`, `sandbox_intune_package_win32`, `sandbox_intune_package_from_host` - test install, verify detection, test uninstall, auto-install Microsoft's Win32 Content Prep Tool if needed, and save `.intunewin` packages to shared artifacts |
 | **Long jobs** | `sandbox_start_job`, `sandbox_job_status`, `sandbox_job_cancel` - run long PowerShell operations without blocking the MCP call, with persisted stdout/stderr artifacts |
 | **Document** | `sandbox_annotate` (boxes/arrows/labels/spotlight), `sandbox_guide_step` + `sandbox_guide_build` + `sandbox_guide_reset` |
@@ -150,6 +151,8 @@ For software that already exists on the host, call `sandbox_stage_host_path` fir
 When you have a candidate silent command, run it through `sandbox_test_install_command`. It executes inside the disposable VM with a timeout and reports the exit code, visible windows, newly registered installed programs, pending-reboot signals, and installer log tails, so an agent can distinguish "switches look plausible" from "this actually installed silently."
 
 Use `sandbox_verify_detection_rule` to prove the detection rule separately from the installer command. It supports MSI product code, registry, file/version, and PowerShell script rules, and can check either expected-present or expected-absent state.
+
+When an install fails, `sandbox_test_install_command` captures Windows Event Log entries (Application/System) around the install window by default — Critical/Error/Warning levels plus `MsiInstaller` result events (1033/1034/11707/11708) — so the failure cause is often visible without re-running. `sandbox_event_logs` collects the same data for an arbitrary window (`lastMinutes` or explicit `startTime`/`endTime`) after the fact, and a test-plan `run` step can set `collectEventLogs` to fold the events into `summary.md` on failure.
 
 For operations that may outlive a normal MCP tool call, use `sandbox_start_job` and poll with `sandbox_job_status`. Jobs persist stdout/stderr under `C:\SandboxBridge\artifacts\jobs`, and `sandbox_job_cancel` kills the running process tree if needed.
 

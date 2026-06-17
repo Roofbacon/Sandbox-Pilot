@@ -510,13 +510,70 @@ function Get-LogTail {
     }
 }
 
+function Get-EventLogWindow {
+    # Collect Windows Event Log entries in a time window for install diagnostics. Keeps
+    # Critical/Error/Warning levels plus any event from AlwaysIncludeProviders (MsiInstaller logs
+    # its install results at Information level, e.g. 1033/1034/11707/11708). The message is trimmed
+    # to its first lines to keep the payload small.
+    param(
+        [datetime]$StartTime,
+        [datetime]$EndTime = (Get-Date),
+        [string[]]$LogNames = @("Application", "System"),
+        [int[]]$Levels = @(1, 2, 3),
+        [string[]]$AlwaysIncludeProviders = @("MsiInstaller"),
+        [int]$MaxEvents = 200
+    )
+
+    $note = $null
+    $events = @()
+    try {
+        $filter = @{ LogName = @($LogNames); StartTime = $StartTime; EndTime = $EndTime }
+        $events = @(Get-WinEvent -FilterHashtable $filter -ErrorAction Stop)
+    }
+    catch {
+        # "No events found in the window" is the common, non-error case; record anything else as a note.
+        $note = $_.Exception.Message
+    }
+
+    $filtered = @($events | Where-Object { ($Levels -contains [int]$_.Level) -or ($AlwaysIncludeProviders -contains $_.ProviderName) } | Sort-Object TimeCreated)
+    $truncated = $false
+    if ($filtered.Count -gt $MaxEvents) { $truncated = $true; $filtered = @($filtered[0..($MaxEvents - 1)]) }
+    $projected = @($filtered | ForEach-Object {
+        $message = ""
+        if ($_.Message) { $message = (($_.Message -split "`r?`n") | Select-Object -First 4) -join " " }
+        [ordered]@{
+            timeCreated = $_.TimeCreated.ToString("o")
+            logName = [string]$_.LogName
+            level = [int]$_.Level
+            levelDisplayName = [string]$_.LevelDisplayName
+            providerName = [string]$_.ProviderName
+            id = [int]$_.Id
+            message = $message
+        }
+    })
+
+    return [ordered]@{
+        logNames = @($LogNames)
+        startTime = $StartTime.ToString("o")
+        endTime = $EndTime.ToString("o")
+        levels = @($Levels)
+        count = $projected.Count
+        truncated = $truncated
+        note = $note
+        events = @($projected)
+    }
+}
+
 function Invoke-InstallerCommandTest {
     param(
         [string]$Command,
         [int]$TimeoutMs = 120000,
         [string]$LogPath = "",
         [int]$LogTailLines = 80,
-        [string]$WorkingDirectory = ""
+        [string]$WorkingDirectory = "",
+        [bool]$CollectEventLogs = $false,
+        [int]$EventLogBufferSeconds = 5,
+        [int]$EventLogMaxEvents = 200
     )
 
     if (-not $Command) { throw "Command is required." }
@@ -587,6 +644,11 @@ function Invoke-InstallerCommandTest {
         catch { }
     }
 
+    $eventLogs = $null
+    if ($CollectEventLogs) {
+        $eventLogs = Get-EventLogWindow -StartTime $started.AddSeconds(-$EventLogBufferSeconds) -EndTime (Get-Date) -MaxEvents $EventLogMaxEvents
+    }
+
     return [ordered]@{
         command = $Command
         startedAt = $started.ToString("o")
@@ -602,6 +664,7 @@ function Invoke-InstallerCommandTest {
         visibleWindows = @(Get-TopLevelWindows)
         pendingReboot = $pendingReboot
         logs = @($logs)
+        eventLogs = $eventLogs
     }
 }
 
@@ -2231,7 +2294,20 @@ function Invoke-AgentCommand {
             $logPath = [string](Get-ArgValue $args "logPath" "")
             $logTailLines = [int](Get-ArgValue $args "logTailLines" 80)
             $workingDirectory = [string](Get-ArgValue $args "workingDirectory" "")
-            return @{ data = (Invoke-InstallerCommandTest -Command $command -TimeoutMs $timeoutMs -LogPath $logPath -LogTailLines $logTailLines -WorkingDirectory $workingDirectory) }
+            $collectEventLogs = [bool](Get-ArgValue $args "collectEventLogs" $false)
+            $eventLogMaxEvents = [int](Get-ArgValue $args "eventLogMaxEvents" 200)
+            return @{ data = (Invoke-InstallerCommandTest -Command $command -TimeoutMs $timeoutMs -LogPath $logPath -LogTailLines $logTailLines -WorkingDirectory $workingDirectory -CollectEventLogs $collectEventLogs -EventLogMaxEvents $eventLogMaxEvents) }
+        }
+        "event_logs" {
+            $lastMinutes = [int](Get-ArgValue $args "lastMinutes" 5)
+            $startTimeArg = [string](Get-ArgValue $args "startTime" "")
+            $endTimeArg = [string](Get-ArgValue $args "endTime" "")
+            $endTime = $(if ($endTimeArg) { [datetime]$endTimeArg } else { Get-Date })
+            $startTime = $(if ($startTimeArg) { [datetime]$startTimeArg } else { $endTime.AddMinutes(-$lastMinutes) })
+            $logNames = @(Get-ArgValue $args "logNames" @("Application", "System"))
+            $levels = @(Get-ArgValue $args "levels" @(1, 2, 3))
+            $maxEvents = [int](Get-ArgValue $args "maxEvents" 200)
+            return @{ data = (Get-EventLogWindow -StartTime $startTime -EndTime $endTime -LogNames $logNames -Levels ([int[]]$levels) -MaxEvents $maxEvents) }
         }
         "detection_verify" {
             $rule = Get-ArgValue $args "rule" $null

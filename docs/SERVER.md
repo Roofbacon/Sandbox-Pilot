@@ -36,7 +36,8 @@ Or use the repo-root helper, which also prints your MCP client config: `..\setup
 | `sandbox_find_install_candidates` | Scan Downloads or a supplied guest path for likely installer payloads and entry points, with technology detection and ranking. |
 | `sandbox_msi_inspect` | Inspect MSI Product metadata, public properties, notable reboot/config flags, and suggest a silent `msiexec /qn` command. |
 | `sandbox_analyze_installers` | Analyze an installer folder or extracted vendor bundle; returns entry points, MSI metadata, script evidence, recommended commands, and notes. |
-| `sandbox_test_install_command` | Run a proposed silent install command with a timeout and optional working directory, then collect exit code, windows, new installed programs, pending reboot state, and log tails. |
+| `sandbox_test_install_command` | Run a proposed silent install command with a timeout and optional working directory, then collect exit code, windows, new installed programs, pending reboot state, log tails, and (by default) Application/System event-log entries around the install window. |
+| `sandbox_event_logs` | Collect Application/System event-log entries (Critical/Error/Warning + MsiInstaller results) for a time window (`lastMinutes` or explicit `startTime`/`endTime`) for after-the-fact install diagnostics. |
 | `sandbox_verify_detection_rule` | Verify MSI product-code, registry, file/version, or PowerShell script detection rules inside the Sandbox, for expected-present or expected-absent states. |
 | `sandbox_assert` | Evaluate one or more pass/fail assertions (file, registry, msiProductCode, script, process, service, window, installedProgram) honoring `expectedPresent`, and return a normalized roll-up. |
 | `sandbox_run_test_plan` | Run an ordered step list (open / run+expectExitCode / assert / capture) and write `junit.xml`, `results.json`, and a screenshot-embedded `summary.md` under `artifacts/testplans/<runId>`; returns the roll-up and host paths. |

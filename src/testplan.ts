@@ -19,6 +19,7 @@ export interface StepSpec {
   run?: string;
   runTimeoutMs?: number;
   expectExitCode?: number;
+  collectEventLogs?: boolean;
   assert?: AssertionSpec[];
   assertTimeoutMs?: number;
   capture?: { caption?: string; window?: boolean; region?: number[] };
@@ -44,7 +45,7 @@ interface StepResult {
   status: StepStatus;
   durationMs: number;
   open?: { target: string; result: any };
-  run?: { command: string; exitCode: number | null; timedOut: boolean; expectExitCode: number; passed: boolean; stdoutTail?: string[]; stderrTail?: string[] };
+  run?: { command: string; exitCode: number | null; timedOut: boolean; expectExitCode: number; passed: boolean; stdoutTail?: string[]; stderrTail?: string[]; eventLogs?: any };
   asserts?: any;
   capture?: { caption?: string; file: string; hostPath: string };
   error?: string;
@@ -124,6 +125,13 @@ function buildMarkdown(plan: TestPlan, steps: StepResult[], summary: any): strin
     }
     if (s.failureReasons.length) md += `- **Failure:** ${s.failureReasons.join("; ")}\n`;
     if (s.error) md += `- **Error:** ${s.error}\n`;
+    const events = s.run?.eventLogs?.events ?? [];
+    if (events.length && s.status === "failed") {
+      md += `- **Event log (${events.length}):**\n`;
+      for (const e of events.slice(0, 15)) {
+        md += `  - \`${e.timeCreated}\` ${e.logName}/${e.levelDisplayName} ${e.providerName} [${e.id}]: ${e.message}\n`;
+      }
+    }
     if (s.capture) {
       if (s.capture.caption) md += `\n${s.capture.caption}\n`;
       md += `\n![${s.name}](${s.capture.file})\n`;
@@ -163,7 +171,8 @@ export async function runTestPlan(deps: RunnerDeps, plan: TestPlan, stampIso: st
 
       if (step.run) {
         const timeoutMs = step.runTimeoutMs ?? 120000;
-        const r = await deps.sendCommand("installer_test", { command: step.run, timeoutMs }, Math.max(timeoutMs, 1000) + 30000);
+        const collectEventLogs = step.collectEventLogs ?? false;
+        const r = await deps.sendCommand("installer_test", { command: step.run, timeoutMs, collectEventLogs }, Math.max(timeoutMs, 1000) + 30000);
         const expect = step.expectExitCode ?? 0;
         const exitCode = r.data?.exitCode ?? null;
         const timedOut = !!r.data?.timedOut;
@@ -176,6 +185,7 @@ export async function runTestPlan(deps: RunnerDeps, plan: TestPlan, stampIso: st
           passed: runPassed,
           stdoutTail: tail(r.data?.stdout),
           stderrTail: tail(r.data?.stderr),
+          eventLogs: r.data?.eventLogs ?? null,
         };
         if (!runPassed) {
           result.failureReasons.push(timedOut ? "run command timed out" : `run exit ${exitCode} != expected ${expect}`);

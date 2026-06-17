@@ -419,6 +419,11 @@ server.registerTool(
       logPath: z.string().optional().describe("Optional expected installer log path to tail."),
       logTailLines: z.number().int().positive().default(80).describe("Number of lines to include from the main log."),
       workingDirectory: z.string().optional().describe("Optional guest working directory to run the command from."),
+      collectEventLogs: z
+        .boolean()
+        .default(true)
+        .describe("Collect Application/System event-log entries (Critical/Error/Warning + MsiInstaller) around the install window for failure diagnostics."),
+      eventLogMaxEvents: z.number().int().positive().default(200).describe("Cap on collected event-log entries."),
     },
   },
   async (args) =>
@@ -431,6 +436,27 @@ server.registerTool(
         )
       ).data,
     ),
+);
+
+server.registerTool(
+  "sandbox_event_logs",
+  {
+    title: "Collect Windows Event Log entries",
+    description:
+      "Read Windows Event Log entries from the Application/System channels in a time window — for " +
+      "diagnosing an install/uninstall failure after the fact. Keeps Critical/Error/Warning levels " +
+      "plus MsiInstaller result events, trims messages, and caps the count. Specify the window with " +
+      "lastMinutes (default 5) or explicit startTime/endTime (ISO 8601).",
+    inputSchema: {
+      lastMinutes: z.number().int().positive().default(5).describe("Look back this many minutes from now (ignored if startTime is given)."),
+      startTime: z.string().optional().describe("ISO 8601 window start; overrides lastMinutes."),
+      endTime: z.string().optional().describe("ISO 8601 window end; defaults to now."),
+      logNames: z.array(z.string()).optional().describe("Channels to read (default Application, System)."),
+      levels: z.array(z.number().int()).optional().describe("Event levels to keep: 1=Critical, 2=Error, 3=Warning, 4=Information (default 1,2,3)."),
+      maxEvents: z.number().int().positive().default(200).describe("Cap on returned entries."),
+    },
+  },
+  async (args) => text((await sendCommand("event_logs", args, 60000)).data),
 );
 
 server.registerTool(
@@ -495,6 +521,7 @@ const testStepSchema = z.object({
   run: z.string().optional().describe("PowerShell/command line to run; its exit code gates the step (see expectExitCode)."),
   runTimeoutMs: z.number().int().positive().optional().describe("Timeout for 'run' (default 120000)."),
   expectExitCode: z.number().int().optional().describe("Exit code that counts as success for 'run' (default 0)."),
+  collectEventLogs: z.boolean().optional().describe("Collect Application/System event logs around this step's 'run' for failure diagnostics (rendered in summary.md on failure)."),
   assert: z.array(assertionSchema).optional().describe("Assertions evaluated after the action; any failure fails the step."),
   assertTimeoutMs: z.number().int().positive().optional().describe("Timeout for script assertions (default 30000)."),
   capture: z

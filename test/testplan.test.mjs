@@ -167,6 +167,37 @@ test("continueOnFailure keeps running later steps", async () => {
   await fsp.rm(root, { recursive: true, force: true });
 });
 
+test("event logs are requested and rendered in summary.md on a failed run", async () => {
+  const root = await freshRoot();
+  let sawCollectFlag = false;
+  const { deps } = makeDeps(root, {
+    installer_test: (args) => {
+      sawCollectFlag = args.collectEventLogs === true;
+      return {
+        exitCode: 1603,
+        timedOut: false,
+        eventLogs: {
+          count: 1,
+          events: [{ timeCreated: "2026-06-17T10:00:01Z", logName: "Application", levelDisplayName: "Error", providerName: "MsiInstaller", id: 11708, message: "Installation failed." }],
+        },
+      };
+    },
+  });
+
+  const out = await runTestPlan(
+    deps,
+    { name: "Diag", steps: [{ name: "Install", run: "msiexec /i x.msi /qn", collectEventLogs: true }] },
+    "2026-06-17T16:00:00.000Z",
+  );
+
+  assert.equal(sawCollectFlag, true, "collectEventLogs flag is forwarded to installer_test");
+  assert.equal(out.steps[0].status, "failed");
+  const summary = await fsp.readFile(out.artifacts.summary, "utf8");
+  assert.match(summary, /\*\*Event log \(1\):\*\*/);
+  assert.match(summary, /MsiInstaller \[11708\]: Installation failed\./);
+  await fsp.rm(root, { recursive: true, force: true });
+});
+
 test("XML special characters in names are escaped in junit", async () => {
   const root = await freshRoot();
   const { deps } = makeDeps(root, { installer_test: () => ({ exitCode: 0, timedOut: false }) });
