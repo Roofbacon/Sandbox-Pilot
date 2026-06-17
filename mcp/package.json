@@ -1,0 +1,27 @@
+{
+  "name": "sandbox-pilot",
+  "version": "0.1.0",
+  "description": "Sandbox Pilot — an MCP server that lets an AI see, click, type, scroll, OCR and build guides inside a disposable Windows Sandbox.",
+  "type": "module",
+  "bin": {
+    "sandbox-pilot": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "pretest": "tsc",
+    "test": "node --test test/bridge.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,2 +1,167 @@
-# Sandbox-Pilot
+# 🧭 Sandbox Pilot
 
+**An MCP server that lets an AI agent drive a disposable Windows Sandbox — see the screen, read the UI tree, click/type/scroll, OCR, and even assemble step-by-step screenshot guides — all inside a throwaway VM that resets when it closes.**
+
+Sandbox Pilot exposes [Windows Sandbox](https://learn.microsoft.com/en-us/windows/security/application-security/application-isolation/windows-sandbox/windows-sandbox-overview) to any [Model Context Protocol](https://modelcontextprotocol.io) client (Claude, Codex, etc.) as a clean set of tools. The AI gets a real, isolated Windows desktop it can operate like a human — without touching your host machine.
+
+---
+
+## Why
+
+- **Safe by construction** — everything happens in Windows Sandbox. Close it and all changes vanish. Great for testing installers, reproducing bugs, trying risky steps, or writing how-to guides.
+- **Accessibility-first sensing** — prefers the **UI Automation tree** (cheap, exact click coordinates) over screenshots, and falls back to vision/OCR only when an app exposes nothing.
+- **Fast** — a persistent TCP socket between host and guest gives ~40–50 ms command round-trips; screenshots come back inline as downscaled JPEG.
+- **Batteries included** — UIA actuation, mouse/keyboard primitives, OCR (bundled Tesseract fallback), image annotation, and an automatic Markdown **guide builder**.
+
+## What it can do
+
+| Area | Tools |
+|---|---|
+| **Sense** | `sandbox_screenshot` (full screen / region / foreground window, inline JPEG), `sandbox_ui_tree` (UIA tree with real-pixel click points), `sandbox_ocr` (Windows OCR + bundled Tesseract fallback), `sandbox_health` |
+| **Act (UIA)** | `sandbox_invoke` — actuate a control by name/automationId via Invoke / Toggle / Select / Expand / SetValue (no coordinates, no focus fuss) |
+| **Act (input)** | `sandbox_click`, `sandbox_double_click`, `sandbox_scroll`, `sandbox_drag`, `sandbox_type`, `sandbox_key`, `sandbox_open`, `sandbox_run_ps`, `sandbox_center_window` |
+| **Synchronize** | `sandbox_wait_for` — block until a UI element appears/disappears (no guessed sleeps) |
+| **Document** | `sandbox_annotate` (boxes/arrows/labels/spotlight), `sandbox_guide_step` + `sandbox_guide_build` + `sandbox_guide_reset` |
+| **Lifecycle** | `sandbox_prepare` (one call to a control-ready Sandbox), `sandbox_status` |
+
+> Example output: the guide builder turns a sequence of captioned, annotated screenshots into a Markdown document — see [`examples/windows-language-guide`](examples/windows-language-guide).
+
+![A captured Settings step](examples/windows-language-guide/images/01-language-and-region.jpg)
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[MCP client<br/>Claude / Codex] -- stdio --> B[Sandbox Pilot<br/>MCP server &#40;Node/TS&#41;]
+    B -- "TCP socket &#40;NDJSON + auth token&#41;" --> C[Guest agent<br/>PowerShell in the Sandbox]
+    B -. "wsb start / exec &#40;lifecycle&#41;" .-> D[Windows Sandbox]
+    C -- "UI Automation / System.Drawing / Win32 input" --> D
+```
+
+- **Host** ([`host/SandboxBridge.ps1`](host/SandboxBridge.ps1)) manages the Sandbox lifecycle via the `wsb` CLI and a small mapped folder.
+- **Guest agent** ([`guest/SandboxAgent.ps1`](guest/SandboxAgent.ps1)) runs inside the Sandbox, listens on a TCP socket, and executes commands using UI Automation, `System.Drawing` (capture), and Win32 input.
+- **MCP server** ([`mcp/`](mcp/)) translates MCP tool calls into agent commands. The guest connects *out* to the host (no host firewall changes needed) and authenticates with a per-session token.
+
+See [`mcp/README.md`](mcp/README.md) for the deep technical reference (transports, latency numbers, internals).
+
+## Requirements
+
+- **Windows 11 Pro / Enterprise / Education** with the **Windows Sandbox** optional feature enabled, and virtualization available.
+- A recent Windows 11 build that ships the **`wsb` CLI** (`wsb start/exec/share/connect`).
+- **Node.js 18+** (developed on 24).
+- Windows PowerShell 5.1 (built in) — used by the host/guest scripts.
+
+Enable Windows Sandbox (admin PowerShell, one time):
+
+```powershell
+Enable-WindowsOptionalFeature -FeatureName "Containers-DisposableClientVM" -All -Online
+```
+
+## Install
+
+```powershell
+git clone <your-fork-url> Sandbox-Pilot
+cd Sandbox-Pilot\mcp
+npm install
+npm run build
+```
+
+## Quick start
+
+1. **Bring up a control-ready Sandbox** (starts/reuses one, opens the interactive session, sets DNS, launches the guest agent over the socket):
+
+   ```powershell
+   .\host\SandboxBridge.ps1 prepare-socket
+   ```
+
+2. **Point your MCP client at the server.** Example client config:
+
+   ```json
+   {
+     "mcpServers": {
+       "sandbox-pilot": {
+         "command": "node",
+         "args": ["C:/Users/you/Git/Sandbox-Pilot/mcp/dist/index.js"],
+         "env": { "SANDBOX_TRANSPORT": "socket" }
+       }
+     }
+   }
+   ```
+
+3. **Use it.** A typical agent loop:
+   - `sandbox_ui_tree` to find a control → `sandbox_invoke` to click it (or `sandbox_click` with the returned coordinates),
+   - `sandbox_wait_for` to sync on the next screen,
+   - `sandbox_screenshot` for a visual check, `sandbox_ocr` when the UI tree is empty,
+   - `sandbox_guide_step` / `sandbox_guide_build` to capture a how-to as you go.
+
+## Sensing guidance (what the agent should prefer)
+
+1. **`sandbox_ui_tree` first** — it returns control type, name, automationId, bounding rect, and a ready-to-use real-pixel `click` point. Cheapest and most reliable.
+2. **`sandbox_invoke`** to actuate by element (Invoke/Toggle/Select/SetValue) — no coordinate math, robust to window movement.
+3. **`sandbox_screenshot`** for genuine visual judgment (rendering, images). Use `window`/`region` to keep it sharp and small.
+4. **`sandbox_ocr`** when an app exposes no UI tree (Chromium/CEF dialogs, custom-drawn UIs, games) — returns words with real-pixel click points.
+
+## Transports
+
+Set `SANDBOX_TRANSPORT`:
+
+- **`socket`** (recommended) — guest listens, host connects out; persistent NDJSON connection, ~40–50 ms round-trips, auth-token gated.
+- **`file`** (default) — commands round-trip through the mapped folder. Simple, but the shared folder's host→guest propagation is cached (~20 s) — fine for batch use, too slow for interactive control.
+
+## OCR
+
+`sandbox_ocr` tries the built-in **Windows.Media.Ocr** engine first. A vanilla Windows Sandbox ships **no OCR language** (and can't reach the Store/Windows-Update feature endpoints), so the agent falls back to a **bundled Tesseract** under `bridge/tools/tesseract/`.
+
+That bundle (~170 MB) is **not committed** (see `.gitignore`). Re-create it on a machine with `winget`:
+
+```powershell
+# 1. download the installer (no admin needed)
+winget download --id UB-Mannheim.TesseractOCR -d .\bridge\tools\_tess_installer --accept-source-agreements --accept-package-agreements
+# 2. inside a running Sandbox (admin, no UAC), silently install it, then copy
+#    "C:\Program Files\Tesseract-OCR\*"  ->  C:\SandboxBridge\tools\tesseract
+# 3. (optional) delete the training .exe/.html/.jar files; only tesseract.exe + DLLs + tessdata are needed.
+```
+
+## Development
+
+```powershell
+cd mcp
+npm test        # offline unit/integration tests (no Sandbox needed)
+node smoke.mjs  # end-to-end smoke test against a running Sandbox (set SANDBOX_TRANSPORT=socket)
+```
+
+After editing the guest agent, redeploy to a running Sandbox in one command:
+
+```powershell
+.\host\SandboxBridge.ps1 reload-agent
+```
+
+> Tip: avoid adding members to the PowerShell `SandboxInput` C# class — PowerShell's Add-Type assembly cache can load a stale type across reloads. Call existing P/Invokes (`mouse_event`, etc.) instead.
+
+## Security & isolation
+
+- Everything runs in **Windows Sandbox**; nothing persists after it closes.
+- The socket is **auth-token gated** — the guest publishes a random per-session token the host must present as its first line; other connectors are rejected.
+- The host↔guest **mapped folder is writable**, which weakens isolation. Keep it narrow and never run untrusted samples with broad host-folder mappings.
+- The host only makes **outbound** connections; no inbound firewall rule is added on your machine.
+
+## Known limitations
+
+- **No Microsoft Store / live Windows-Update FODs** inside the Sandbox — so native display-language packs and Windows OCR languages can't be installed there. (OCR uses bundled Tesseract instead; see above.)
+- The Sandbox's **interactive session can drop to a headless 200×200** between long idle gaps; `sandbox_health` reports it (`headless: true`) and `prepare-socket` / `reload-agent` restore it.
+- Feature-on-Demand packs (if you want native OCR/languages) must be added **offline** from a build-matched FOD ISO.
+
+## Repository layout
+
+```
+Sandbox-Pilot/
+├─ host/              # SandboxBridge.ps1 (lifecycle + CLI), AnnotateScreenshot.ps1
+├─ guest/             # SandboxAgent.ps1 — the in-Sandbox agent (source of truth)
+├─ bridge/            # mapped host<->guest folder: source helpers (+ runtime files, gitignored)
+├─ mcp/               # the MCP server (TypeScript), tests, smoke test
+└─ examples/          # a generated guide (Windows display-language change)
+```
+
+## License
+
+No license file is included yet — add one (MIT is a common choice) before publishing.
