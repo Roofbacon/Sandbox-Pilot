@@ -10,9 +10,10 @@ It supports two transports (see **Transports** below) and shells out to
 ## Build
 
 ```powershell
-npm install
-npm run build
+npm install   # builds automatically via the "prepare" script (runs tsc)
 ```
+
+Or use the repo-root helper, which also prints your MCP client config: `..\setup.ps1`.
 
 ## Tools
 
@@ -148,15 +149,17 @@ bridge folder is mapped). Word boxes are mapped to real screen coordinates, so e
 `click` point feeds straight into `sandbox_click`.
 
 The bundle is a **~174 MB runtime artifact** (mostly `libtesseract` + ICU data) — treat it like
-a downloaded dependency, not committed source. To (re)create it on a machine with `winget`:
+a downloaded dependency, not committed source. Create it with one command (with a Sandbox
+running — do `prepare-socket` first):
 
 ```powershell
-# 1. download the installer (no admin needed)
-winget download --id UB-Mannheim.TesseractOCR -d .\bridge\tools\_tess_installer --accept-source-agreements --accept-package-agreements
-# 2. inside a running Sandbox (admin, no UAC), silent-install and copy into the mapped folder:
-#    Start-Process <installer> '/S'; then copy "C:\Program Files\Tesseract-OCR\*" to C:\SandboxBridge\tools\tesseract
-# 3. (optional) delete the training .exe/.html/.jar files — only tesseract.exe + DLLs + tessdata are needed.
+.\host\SandboxBridge.ps1 bundle-tesseract
 ```
+
+It downloads the installer on the host, installs it inside the Sandbox (elevated via
+`--run-as System`, no UAC), copies the runtime into `bridge/tools/tesseract/`, and trims the
+training tools. Idempotent — skips if already present. (The guest-side step is
+`bridge/InstallTesseract.ps1`.)
 
 If you instead want **native Windows OCR** (or display-language packs), that needs the matching
 build-26200 **Features-on-Demand ISO** added offline via `Add-WindowsCapability -Source -LimitAccess`

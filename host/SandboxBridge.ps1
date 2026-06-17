@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("init", "start", "prepare-guide", "prepare-socket", "reload-agent", "connect", "attach", "attach-socket", "set-dns", "list", "send", "screenshot", "ui-tree", "center-window", "inventory", "processes", "click", "type", "paste", "set-focused-text", "key", "run-ps", "run-cmd", "open", "wait-result", "stop-agent", "clean")]
+    [ValidateSet("init", "start", "prepare-guide", "prepare-socket", "reload-agent", "bundle-tesseract", "connect", "attach", "attach-socket", "set-dns", "list", "send", "screenshot", "ui-tree", "center-window", "inventory", "processes", "click", "type", "paste", "set-focused-text", "key", "run-ps", "run-cmd", "open", "wait-result", "stop-agent", "clean")]
     [string]$Action,
 
     [string]$Type,
@@ -334,6 +334,51 @@ function Reload-SocketAgent {
     }
 }
 
+function Bundle-Tesseract {
+    # One-command offline-OCR setup: download Tesseract on the host, then (inside a running
+    # Sandbox, elevated) install it, copy the runtime into the mapped tools\tesseract folder so
+    # it persists to the host, and trim training tools. Idempotent — skips if already bundled.
+    param([string]$TargetSandboxId)
+
+    Initialize-Bridge | Out-Null
+    $tessExe = Join-Path $BridgeRoot "tools\tesseract\tesseract.exe"
+    if (Test-Path $tessExe) {
+        return [pscustomobject]@{ bundled = $true; alreadyPresent = $true; path = $tessExe }
+    }
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        throw "winget not found on the host; cannot download Tesseract."
+    }
+    if (-not $TargetSandboxId) { $TargetSandboxId = Get-DefaultSandboxId }
+
+    # 1. Download the installer on the host (no admin needed).
+    $dlDir = Join-Path $BridgeRoot "tools\_tess_installer"
+    New-Item -ItemType Directory -Force -Path $dlDir | Out-Null
+    & winget download --id UB-Mannheim.TesseractOCR --accept-source-agreements --accept-package-agreements -d $dlDir --disable-interactivity | Out-Null
+
+    # 2. Share + let the installer and InstallTesseract.ps1 propagate into the guest.
+    $hostPath = (Resolve-Path $BridgeRoot).Path
+    & wsb share --id $TargetSandboxId --host-path $hostPath --sandbox-path "C:\SandboxBridge" --allow-write | Out-Null
+    Start-Sleep -Seconds 30
+
+    # 3. Install + copy + trim inside the guest (System = elevated, no UAC).
+    $marker = Join-Path $ResultsDir "tess-bundle.txt"
+    if (Test-Path $marker) { Remove-Item -Force $marker }
+    & wsb exec --id $TargetSandboxId --run-as System --command 'cmd.exe /c powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\SandboxBridge\InstallTesseract.ps1' | Out-Null
+    $deadline = (Get-Date).AddSeconds(240)
+    while (-not (Test-Path $marker) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
+    $detail = if (Test-Path $marker) { (Get-Content -Path $marker -Raw).Trim() } else { "timed out waiting for install" }
+
+    # 4. Clean up the downloaded installer.
+    Remove-Item -Recurse -Force $dlDir -ErrorAction SilentlyContinue
+
+    [pscustomobject]@{
+        bundled = (Test-Path $tessExe)
+        alreadyPresent = $false
+        detail = $detail
+        path = $tessExe
+    }
+}
+
 function Wait-BridgeResult {
     param(
         [Parameter(Mandatory = $true)][string]$CommandId,
@@ -413,6 +458,9 @@ switch ($Action) {
     }
     "reload-agent" {
         Reload-SocketAgent -TargetSandboxId $SandboxId | ConvertTo-Json -Depth 10
+    }
+    "bundle-tesseract" {
+        Bundle-Tesseract -TargetSandboxId $SandboxId | ConvertTo-Json -Depth 10
     }
     "connect" {
         Connect-SandboxWindow -TargetSandboxId $SandboxId | ConvertTo-Json -Depth 10

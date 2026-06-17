@@ -59,11 +59,19 @@ Enable-WindowsOptionalFeature -FeatureName "Containers-DisposableClientVM" -All 
 
 ## Install
 
+One command — checks Node + Windows Sandbox, installs & builds the server, and prints the exact MCP client config to paste:
+
 ```powershell
-git clone <your-fork-url> Sandbox-Pilot
+git clone https://github.com/Roofbacon/Sandbox-Pilot.git
+cd Sandbox-Pilot
+.\setup.ps1
+```
+
+Prefer to do it by hand? `npm install` builds automatically (via the package's `prepare` script — no separate build step):
+
+```powershell
 cd Sandbox-Pilot\mcp
 npm install
-npm run build
 ```
 
 ## Quick start
@@ -112,15 +120,13 @@ Set `SANDBOX_TRANSPORT`:
 
 `sandbox_ocr` tries the built-in **Windows.Media.Ocr** engine first. A vanilla Windows Sandbox ships **no OCR language** (and can't reach the Store/Windows-Update feature endpoints), so the agent falls back to a **bundled Tesseract** under `bridge/tools/tesseract/`.
 
-That bundle (~170 MB) is **not committed** (see `.gitignore`). Re-create it on a machine with `winget`:
+That bundle (~170 MB) is **not committed** (see `.gitignore`). Create it with **one command** (with a Sandbox running — do `prepare-socket` first):
 
 ```powershell
-# 1. download the installer (no admin needed)
-winget download --id UB-Mannheim.TesseractOCR -d .\bridge\tools\_tess_installer --accept-source-agreements --accept-package-agreements
-# 2. inside a running Sandbox (admin, no UAC), silently install it, then copy
-#    "C:\Program Files\Tesseract-OCR\*"  ->  C:\SandboxBridge\tools\tesseract
-# 3. (optional) delete the training .exe/.html/.jar files; only tesseract.exe + DLLs + tessdata are needed.
+.\host\SandboxBridge.ps1 bundle-tesseract
 ```
+
+This downloads Tesseract on the host, installs it inside the Sandbox (elevated, no UAC), copies the runtime into `bridge/tools/tesseract/` (persisted on the host), and trims it to the recognition essentials. It's **idempotent** (skips if already bundled). Tesseract is **optional** — without it, `sandbox_ocr` still works wherever a Windows OCR language is present, and otherwise returns a clear, actionable error.
 
 ## Development
 
@@ -164,4 +170,4 @@ Sandbox-Pilot/
 
 ## License
 
-No license file is included yet — add one (MIT is a common choice) before publishing.
+[MIT](LICENSE) © 2026 Roofbacon.
