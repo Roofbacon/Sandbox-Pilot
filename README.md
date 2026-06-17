@@ -1,4 +1,8 @@
-# 🧭 Sandbox Pilot
+<p align="center">
+  <img src="Sandbox%20Pilot.png" alt="Sandbox Pilot logo" width="420">
+</p>
+
+# Sandbox Pilot
 
 **An MCP server that lets an AI agent drive a disposable Windows Sandbox — see the screen, read the UI tree, click/type/scroll, OCR, and even assemble step-by-step screenshot guides — all inside a throwaway VM that resets when it closes.**
 
