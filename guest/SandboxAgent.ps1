@@ -15,11 +15,12 @@ $ResultsDir = Join-Path $BridgeRoot "results"
 $ArtifactsDir = Join-Path $BridgeRoot "artifacts"
 $ScreenshotsDir = Join-Path $ArtifactsDir "screenshots"
 $IntuneArtifactsDir = Join-Path $ArtifactsDir "intune"
+$JobsDir = Join-Path $ArtifactsDir "jobs"
 $ToolsDir = Join-Path $BridgeRoot "tools"
 $LogsDir = Join-Path $BridgeRoot "logs"
 $LogPath = Join-Path $LogsDir "sandbox-agent.log"
 
-foreach ($dir in @($CommandsDir, $ProcessedDir, $ResultsDir, $ArtifactsDir, $ScreenshotsDir, $IntuneArtifactsDir, $ToolsDir, $LogsDir)) {
+foreach ($dir in @($CommandsDir, $ProcessedDir, $ResultsDir, $ArtifactsDir, $ScreenshotsDir, $IntuneArtifactsDir, $JobsDir, $ToolsDir, $LogsDir)) {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
 }
 
@@ -667,6 +668,250 @@ function Invoke-CapturedProcess {
     }
 }
 
+function Write-Utf8JsonFile {
+    param([string]$Path, $Value, [int]$Depth = 20)
+    [System.IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth $Depth), (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Get-SandboxJobPaths {
+    param([string]$JobId)
+
+    $jobRoot = Join-Path $JobsDir $JobId
+    return [ordered]@{
+        root = $jobRoot
+        metadata = Join-Path $jobRoot "metadata.json"
+        command = Join-Path $jobRoot "command.ps1"
+        wrapper = Join-Path $jobRoot "wrapper.ps1"
+        result = Join-Path $jobRoot "result.json"
+        stdout = Join-Path $jobRoot "stdout.log"
+        stderr = Join-Path $jobRoot "stderr.log"
+    }
+}
+
+function Stop-ProcessTree {
+    param([int]$ProcessId)
+    try { & taskkill.exe /PID $ProcessId /T /F | Out-Null }
+    catch {
+        try {
+            $p = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+            if ($p) { $p.Kill() }
+        }
+        catch { }
+    }
+}
+
+function Get-TextTail {
+    param([string]$Path, [int]$TailLines = 80)
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    return @((Get-Content -LiteralPath $Path -Tail $TailLines -ErrorAction SilentlyContinue))
+}
+
+function Start-SandboxPowerShellJob {
+    param(
+        [string]$Command,
+        [int]$TimeoutMs = 600000,
+        [string]$WorkingDirectory = ""
+    )
+
+    if (-not $Command) { throw "Command is required." }
+    $jobId = [guid]::NewGuid().ToString()
+    $paths = Get-SandboxJobPaths -JobId $jobId
+    New-Item -ItemType Directory -Force -Path $paths.root | Out-Null
+    [System.IO.File]::WriteAllText($paths.command, $Command, (New-Object System.Text.UTF8Encoding($false)))
+
+    $wrapper = @'
+param(
+    [string]$CommandPath,
+    [string]$ResultPath
+)
+$ErrorActionPreference = "Continue"
+$ProgressPreference = "SilentlyContinue"
+$started = Get-Date
+$exitCode = 0
+$errorMessage = $null
+try {
+    $command = Get-Content -LiteralPath $CommandPath -Raw
+    $wrapped = '$ProgressPreference = "SilentlyContinue"; & { ' + $command + ' }; if ($null -ne $global:LASTEXITCODE) { exit $global:LASTEXITCODE }'
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($wrapped))
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded
+    if ($null -ne $global:LASTEXITCODE) { $exitCode = $global:LASTEXITCODE }
+}
+catch {
+    $errorMessage = $_.Exception.Message
+    if ($null -ne $global:LASTEXITCODE) { $exitCode = $global:LASTEXITCODE }
+    else { $exitCode = 1 }
+}
+$result = [ordered]@{
+    status = "completed"
+    startedAt = $started.ToString("o")
+    finishedAt = (Get-Date).ToString("o")
+    timedOut = $false
+    cancelled = $false
+    exitCode = $exitCode
+    error = $errorMessage
+}
+[System.IO.File]::WriteAllText($ResultPath, ($result | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
+exit $exitCode
+'@
+    [System.IO.File]::WriteAllText($paths.wrapper, $wrapper, (New-Object System.Text.UTF8Encoding($false)))
+
+    $resolvedWorkingDirectory = ""
+    if ($WorkingDirectory) {
+        if (-not (Test-Path -LiteralPath $WorkingDirectory)) { throw "workingDirectory does not exist: $WorkingDirectory" }
+        $resolvedWorkingDirectory = (Resolve-Path -LiteralPath $WorkingDirectory).Path
+    }
+
+    $arguments = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", $paths.wrapper,
+        "-CommandPath", $paths.command,
+        "-ResultPath", $paths.result
+    )
+    $startInfo = @{
+        FilePath = "powershell.exe"
+        ArgumentList = $arguments
+        PassThru = $true
+        WindowStyle = "Hidden"
+        RedirectStandardOutput = $paths.stdout
+        RedirectStandardError = $paths.stderr
+    }
+    if ($resolvedWorkingDirectory) { $startInfo.WorkingDirectory = $resolvedWorkingDirectory }
+    $process = Start-Process @startInfo
+    $metadata = [ordered]@{
+        jobId = $jobId
+        type = "powershell"
+        command = $Command
+        pid = $process.Id
+        startedAt = (Get-Date).ToString("o")
+        timeoutMs = $TimeoutMs
+        workingDirectory = $resolvedWorkingDirectory
+        paths = [ordered]@{
+            root = $paths.root
+            result = $paths.result
+            stdout = $paths.stdout
+            stderr = $paths.stderr
+        }
+    }
+    Write-Utf8JsonFile -Path $paths.metadata -Value $metadata
+    return (Get-SandboxJobStatus -JobId $jobId -TailLines 20)
+}
+
+function Get-SandboxJobStatus {
+    param([string]$JobId, [int]$TailLines = 80)
+
+    if (-not $JobId) { throw "jobId is required." }
+    $paths = Get-SandboxJobPaths -JobId $JobId
+    if (-not (Test-Path -LiteralPath $paths.metadata)) { throw "Unknown jobId: $JobId" }
+    $metadata = Get-Content -LiteralPath $paths.metadata -Raw | ConvertFrom-Json
+    $result = $null
+    if (Test-Path -LiteralPath $paths.result) {
+        try {
+            $result = Get-Content -LiteralPath $paths.result -Raw | ConvertFrom-Json
+        }
+        catch {
+            $result = [ordered]@{
+                status = "running"
+                startedAt = $metadata.startedAt
+                finishedAt = $null
+                timedOut = $false
+                cancelled = $false
+                exitCode = $null
+                error = "Result file is not readable yet."
+            }
+        }
+    }
+    else {
+        $process = Get-Process -Id ([int]$metadata.pid) -ErrorAction SilentlyContinue
+        $started = [datetime]$metadata.startedAt
+        $elapsedMs = [int]((Get-Date) - $started).TotalMilliseconds
+        if ($process -and $metadata.timeoutMs -gt 0 -and $elapsedMs -gt [int]$metadata.timeoutMs) {
+            Stop-ProcessTree -ProcessId ([int]$metadata.pid)
+            $result = [ordered]@{
+                status = "timedOut"
+                startedAt = $metadata.startedAt
+                finishedAt = (Get-Date).ToString("o")
+                timedOut = $true
+                cancelled = $false
+                exitCode = $null
+                error = "Job exceeded timeoutMs."
+            }
+            Write-Utf8JsonFile -Path $paths.result -Value $result
+        }
+        elseif ($process) {
+            $result = [ordered]@{
+                status = "running"
+                startedAt = $metadata.startedAt
+                finishedAt = $null
+                timedOut = $false
+                cancelled = $false
+                exitCode = $null
+                error = $null
+            }
+        }
+        else {
+            $result = [ordered]@{
+                status = "unknown"
+                startedAt = $metadata.startedAt
+                finishedAt = (Get-Date).ToString("o")
+                timedOut = $false
+                cancelled = $false
+                exitCode = $null
+                error = "Process exited without writing a result file."
+            }
+            Write-Utf8JsonFile -Path $paths.result -Value $result
+        }
+    }
+
+    return [ordered]@{
+        jobId = $JobId
+        type = $metadata.type
+        command = $metadata.command
+        pid = $metadata.pid
+        timeoutMs = $metadata.timeoutMs
+        workingDirectory = $metadata.workingDirectory
+        status = $result.status
+        timedOut = $result.timedOut
+        cancelled = $result.cancelled
+        exitCode = $result.exitCode
+        error = $result.error
+        startedAt = $result.startedAt
+        finishedAt = $result.finishedAt
+        stdoutTail = @(Get-TextTail -Path $paths.stdout -TailLines $TailLines)
+        stderrTail = @(Get-TextTail -Path $paths.stderr -TailLines $TailLines)
+        paths = [ordered]@{
+            root = $paths.root
+            result = $paths.result
+            stdout = $paths.stdout
+            stderr = $paths.stderr
+            bridgeRelativePath = ConvertTo-BridgeRelativePath -Path $paths.root
+        }
+    }
+}
+
+function Stop-SandboxJob {
+    param([string]$JobId)
+
+    if (-not $JobId) { throw "jobId is required." }
+    $paths = Get-SandboxJobPaths -JobId $JobId
+    if (-not (Test-Path -LiteralPath $paths.metadata)) { throw "Unknown jobId: $JobId" }
+    $metadata = Get-Content -LiteralPath $paths.metadata -Raw | ConvertFrom-Json
+    if (-not (Test-Path -LiteralPath $paths.result)) {
+        Stop-ProcessTree -ProcessId ([int]$metadata.pid)
+        $result = [ordered]@{
+            status = "cancelled"
+            startedAt = $metadata.startedAt
+            finishedAt = (Get-Date).ToString("o")
+            timedOut = $false
+            cancelled = $true
+            exitCode = $null
+            error = "Cancelled by sandbox_job_cancel."
+        }
+        Write-Utf8JsonFile -Path $paths.result -Value $result
+    }
+    return Get-SandboxJobStatus -JobId $JobId
+}
+
 function Get-IntuneToolVersion {
     param([string]$ToolPath)
 
@@ -829,6 +1074,214 @@ function Get-IntunePackagingMetadata {
     }
 }
 
+function Test-VersionAtLeast {
+    param([string]$Actual, [string]$Minimum)
+
+    if (-not $Minimum) { return $true }
+    if (-not $Actual) { return $false }
+    try { return ([version]$Actual -ge [version]$Minimum) }
+    catch { return ($Actual -ge $Minimum) }
+}
+
+function Test-MsiProductDetection {
+    param([string]$ProductCode, [string]$ProductVersion = "")
+
+    $registryPaths = @(
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+    # NB: do not name this $matches - that is a PowerShell automatic variable populated by -match.
+    $found = foreach ($path in $registryPaths) {
+        Get-ItemProperty -Path $path -ErrorAction SilentlyContinue |
+            Where-Object {
+                ($_.PSChildName -eq $ProductCode) -or
+                ($_.UninstallString -and ([string]$_.UninstallString).IndexOf($ProductCode, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+            } |
+            Select-Object PSPath, PSChildName, DisplayName, DisplayVersion, Publisher, UninstallString
+    }
+    $found = @($found)
+    $versionOk = $true
+    if ($ProductVersion -and $found.Count -gt 0) {
+        $versionOk = $false
+        foreach ($entry in $found) {
+            if ([string]$entry.DisplayVersion -eq $ProductVersion) { $versionOk = $true; break }
+        }
+    }
+    return [ordered]@{
+        detected = (($found.Count -gt 0) -and $versionOk)
+        matchCount = $found.Count
+        matches = @($found)
+        versionOk = $versionOk
+    }
+}
+
+function Test-RegistryDetection {
+    param($Rule)
+
+    $path = [string](Get-ObjectPropertyValue -Object $Rule -Name "path" "")
+    if (-not $path) { throw "registry detection requires path." }
+    $exists = Test-Path -LiteralPath $path
+    $valueName = [string](Get-ObjectPropertyValue -Object $Rule -Name "valueName" "")
+    if (-not $exists -or -not $valueName) {
+        return [ordered]@{ detected = $exists; path = $path; valueName = $valueName; value = $null }
+    }
+
+    $value = Get-ObjectPropertyValue -Object (Get-ItemProperty -LiteralPath $path -ErrorAction SilentlyContinue) -Name $valueName
+    $operator = [string](Get-ObjectPropertyValue -Object $Rule -Name "operator" "exists")
+    $expected = Get-ObjectPropertyValue -Object $Rule -Name "value"
+    $detected = $false
+    switch ($operator) {
+        "equals" { $detected = ([string]$value -eq [string]$expected) }
+        "contains" { $detected = ([string]$value).IndexOf([string]$expected, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 }
+        "notEquals" { $detected = ([string]$value -ne [string]$expected) }
+        default { $detected = ($null -ne $value) }
+    }
+    return [ordered]@{ detected = $detected; path = $path; valueName = $valueName; operator = $operator; expected = $expected; value = $value }
+}
+
+function Test-FileDetection {
+    param($Rule)
+
+    $path = [string](Get-ObjectPropertyValue -Object $Rule -Name "path" "")
+    if (-not $path) { throw "file detection requires path." }
+    $exists = Test-Path -LiteralPath $path
+    if (-not $exists) {
+        return [ordered]@{ detected = $false; path = $path; exists = $false }
+    }
+    $item = Get-Item -LiteralPath $path
+    $fileVersion = $null
+    try { $fileVersion = $item.VersionInfo.FileVersion } catch { }
+    $productVersion = $null
+    try { $productVersion = $item.VersionInfo.ProductVersion } catch { }
+    $minVersion = [string](Get-ObjectPropertyValue -Object $Rule -Name "minVersion" "")
+    $version = [string](Get-ObjectPropertyValue -Object $Rule -Name "version" "")
+    $versionOk = $true
+    if ($version) { $versionOk = (($fileVersion -eq $version) -or ($productVersion -eq $version)) }
+    elseif ($minVersion) { $versionOk = ((Test-VersionAtLeast -Actual $fileVersion -Minimum $minVersion) -or (Test-VersionAtLeast -Actual $productVersion -Minimum $minVersion)) }
+    return [ordered]@{
+        detected = ($exists -and $versionOk)
+        path = $item.FullName
+        exists = $exists
+        fileVersion = $fileVersion
+        productVersion = $productVersion
+        minVersion = $minVersion
+        version = $version
+        versionOk = $versionOk
+    }
+}
+
+function Test-ScriptDetection {
+    param($Rule, [int]$TimeoutMs = 30000)
+
+    $script = [string](Get-ObjectPropertyValue -Object $Rule -Name "script" "")
+    if (-not $script) { $script = [string](Get-ObjectPropertyValue -Object $Rule -Name "command" "") }
+    if (-not $script) { throw "script detection requires script or command." }
+    $result = Invoke-InstallerCommandTest -Command $script -TimeoutMs $TimeoutMs
+    return [ordered]@{
+        detected = ((-not $result.timedOut) -and ($result.exitCode -eq 0))
+        exitCode = $result.exitCode
+        timedOut = $result.timedOut
+        stdout = $result.stdout
+        stderr = $result.stderr
+    }
+}
+
+function Test-DetectionRule {
+    param(
+        $Rule,
+        [bool]$ExpectedPresent = $true,
+        [int]$TimeoutMs = 30000
+    )
+
+    if (-not $Rule) {
+        return [ordered]@{
+            skipped = $true
+            reason = "No detection rule was provided."
+            expectedPresent = $ExpectedPresent
+            passed = $false
+        }
+    }
+
+    $type = [string](Get-ObjectPropertyValue -Object $Rule -Name "type" "")
+    if (-not $type) { throw "detection rule requires type." }
+    $evidence = $null
+    switch ($type) {
+        "msiProductCode" {
+            $productCode = [string](Get-ObjectPropertyValue -Object $Rule -Name "productCode" "")
+            if (-not $productCode) { throw "msiProductCode detection requires productCode." }
+            $productVersion = [string](Get-ObjectPropertyValue -Object $Rule -Name "productVersion" "")
+            $evidence = Test-MsiProductDetection -ProductCode $productCode -ProductVersion $productVersion
+        }
+        "registry" { $evidence = Test-RegistryDetection -Rule $Rule }
+        "file" { $evidence = Test-FileDetection -Rule $Rule }
+        "script" { $evidence = Test-ScriptDetection -Rule $Rule -TimeoutMs $TimeoutMs }
+        default { throw "Unsupported detection rule type: $type" }
+    }
+
+    $detected = [bool](Get-ObjectPropertyValue -Object $evidence -Name "detected" $false)
+    return [ordered]@{
+        type = $type
+        expectedPresent = $ExpectedPresent
+        detected = $detected
+        passed = $(if ($ExpectedPresent) { $detected } else { -not $detected })
+        evidence = $evidence
+    }
+}
+
+function Test-PackagingDetectionRule {
+    param(
+        $Rule,
+        [bool]$ExpectedPresent = $true,
+        [int]$TimeoutMs = 30000
+    )
+
+    if (-not $Rule) {
+        return [ordered]@{ skipped = $true; passed = $true; reason = "No concrete detection rule was available."; expectedPresent = $ExpectedPresent }
+    }
+    $type = [string](Get-ObjectPropertyValue -Object $Rule -Name "type" "")
+    if (@("msiProductCode", "registry", "file", "script") -notcontains $type) {
+        return [ordered]@{
+            skipped = $true
+            passed = $true
+            reason = "Detection rule type '$type' is a placeholder or is not supported for automated verification."
+            expectedPresent = $ExpectedPresent
+        }
+    }
+    return Test-DetectionRule -Rule $Rule -ExpectedPresent $ExpectedPresent -TimeoutMs $TimeoutMs
+}
+
+function New-PackagingFailure {
+    # Shared shape for every "package creation was skipped" early return in Invoke-IntuneWin32Package,
+    # so the field set stays in one place.
+    param(
+        [string]$SourceFolder,
+        [string]$SetupFile,
+        [string]$OutputFolder,
+        $Metadata,
+        $InstallTest = $null,
+        $DetectionAfterInstall = $null,
+        $UninstallTest = $null,
+        $DetectionAfterUninstall = $null,
+        [string]$Warning
+    )
+    return [ordered]@{
+        sourceFolder = $SourceFolder
+        setupFile = $SetupFile
+        outputFolder = $OutputFolder
+        tool = $null
+        process = $null
+        succeeded = $false
+        packages = @()
+        metadata = $Metadata
+        installTest = $InstallTest
+        detectionAfterInstall = $DetectionAfterInstall
+        uninstallTest = $UninstallTest
+        detectionAfterUninstall = $DetectionAfterUninstall
+        warning = $Warning
+    }
+}
+
 function Invoke-IntuneWin32Package {
     param(
         [string]$SourceFolder,
@@ -836,6 +1289,7 @@ function Invoke-IntuneWin32Package {
         [string]$OutputFolder = "",
         [string]$InstallCommand = "",
         [string]$UninstallCommand = "",
+        $DetectionRule = $null,
         [string]$ToolPath = "",
         [bool]$EnsureTool = $true,
         [string]$DownloadUrl = "",
@@ -843,7 +1297,10 @@ function Invoke-IntuneWin32Package {
         [bool]$IncludeCatalog = $false,
         [int]$TimeoutMs = 300000,
         [bool]$TestInstall = $true,
-        [int]$InstallTestTimeoutMs = 90000
+        [int]$InstallTestTimeoutMs = 90000,
+        [bool]$VerifyDetection = $true,
+        [bool]$TestUninstall = $true,
+        [int]$UninstallTestTimeoutMs = 90000
     )
 
     if (-not $SourceFolder) { throw "sourceFolder is required." }
@@ -854,44 +1311,75 @@ function Invoke-IntuneWin32Package {
     $resolvedOutput = (Resolve-Path -LiteralPath $OutputFolder).Path
     $setup = Resolve-SetupFileForIntune -SourceFolder $resolvedSource -SetupFile $SetupFile
     $metadata = Get-IntunePackagingMetadata -SetupPath $setup.path -InstallCommand $InstallCommand -UninstallCommand $UninstallCommand
+    $effectiveDetectionRule = $DetectionRule
+    if (-not $effectiveDetectionRule) { $effectiveDetectionRule = $metadata.detection }
 
     $installTest = $null
+    $detectionAfterInstall = $null
+    $uninstallTest = $null
+    $detectionAfterUninstall = $null
     if ($TestInstall) {
         if (-not $metadata.installCommand) {
-            return [ordered]@{
-                sourceFolder = $resolvedSource
-                setupFile = $setup.relative
-                outputFolder = $resolvedOutput
-                tool = $null
-                process = $null
-                succeeded = $false
-                packages = @()
-                metadata = $metadata
-                installTest = [ordered]@{ skipped = $true; reason = "No install command was provided or inferred, so the package was not created." }
-                warning = "Install test was required but no install command was available."
-            }
+            return New-PackagingFailure -SourceFolder $resolvedSource -SetupFile $setup.relative -OutputFolder $resolvedOutput -Metadata $metadata `
+                -InstallTest ([ordered]@{ skipped = $true; reason = "No install command was provided or inferred, so the package was not created." }) `
+                -Warning "Install test was required but no install command was available."
         }
 
         $installTest = Invoke-InstallerCommandTest -Command $metadata.installCommand -TimeoutMs $InstallTestTimeoutMs -WorkingDirectory $resolvedSource
         $successExitCodes = @(0, 1707, 3010, 1641)
         $installTestPassed = ((-not $installTest.timedOut) -and ($null -ne $installTest.exitCode) -and ($successExitCodes -contains [int]$installTest.exitCode))
         if (-not $installTestPassed) {
-            return [ordered]@{
-                sourceFolder = $resolvedSource
-                setupFile = $setup.relative
-                outputFolder = $resolvedOutput
-                tool = $null
-                process = $null
-                succeeded = $false
-                packages = @()
-                metadata = $metadata
-                installTest = $installTest
-                warning = "Install test failed or timed out; Intune package creation was skipped."
+            return New-PackagingFailure -SourceFolder $resolvedSource -SetupFile $setup.relative -OutputFolder $resolvedOutput -Metadata $metadata `
+                -InstallTest $installTest `
+                -Warning "Install test failed or timed out; Intune package creation was skipped."
+        }
+        if ($VerifyDetection) {
+            $detectionAfterInstall = Test-PackagingDetectionRule -Rule $effectiveDetectionRule -ExpectedPresent $true
+            if (-not $detectionAfterInstall.passed) {
+                return New-PackagingFailure -SourceFolder $resolvedSource -SetupFile $setup.relative -OutputFolder $resolvedOutput -Metadata $metadata `
+                    -InstallTest $installTest -DetectionAfterInstall $detectionAfterInstall `
+                    -Warning "Detection rule did not match after install; Intune package creation was skipped."
             }
+        }
+        else {
+            $detectionAfterInstall = [ordered]@{ skipped = $true; reason = "verifyDetection was set to false." }
+        }
+
+        if ($TestUninstall) {
+            if (-not $metadata.uninstallCommand) {
+                $uninstallTest = [ordered]@{ skipped = $true; reason = "No uninstall command was provided or inferred." }
+            }
+            else {
+                $uninstallTest = Invoke-InstallerCommandTest -Command $metadata.uninstallCommand -TimeoutMs $UninstallTestTimeoutMs -WorkingDirectory $resolvedSource
+                $successExitCodes = @(0, 1605, 1707, 3010, 1641)
+                $uninstallTestPassed = ((-not $uninstallTest.timedOut) -and ($null -ne $uninstallTest.exitCode) -and ($successExitCodes -contains [int]$uninstallTest.exitCode))
+                if (-not $uninstallTestPassed) {
+                    return New-PackagingFailure -SourceFolder $resolvedSource -SetupFile $setup.relative -OutputFolder $resolvedOutput -Metadata $metadata `
+                        -InstallTest $installTest -DetectionAfterInstall $detectionAfterInstall -UninstallTest $uninstallTest `
+                        -Warning "Uninstall test failed or timed out; Intune package creation was skipped."
+                }
+                if ($VerifyDetection) {
+                    $detectionAfterUninstall = Test-PackagingDetectionRule -Rule $effectiveDetectionRule -ExpectedPresent $false
+                    if (-not $detectionAfterUninstall.passed) {
+                        return New-PackagingFailure -SourceFolder $resolvedSource -SetupFile $setup.relative -OutputFolder $resolvedOutput -Metadata $metadata `
+                            -InstallTest $installTest -DetectionAfterInstall $detectionAfterInstall -UninstallTest $uninstallTest -DetectionAfterUninstall $detectionAfterUninstall `
+                            -Warning "Detection rule still matched after uninstall; Intune package creation was skipped."
+                    }
+                }
+                else {
+                    $detectionAfterUninstall = [ordered]@{ skipped = $true; reason = "verifyDetection was set to false." }
+                }
+            }
+        }
+        else {
+            $uninstallTest = [ordered]@{ skipped = $true; reason = "testUninstall was set to false." }
         }
     }
     else {
         $installTest = [ordered]@{ skipped = $true; reason = "testInstall was set to false." }
+        $detectionAfterInstall = [ordered]@{ skipped = $true; reason = "testInstall was set to false." }
+        $uninstallTest = [ordered]@{ skipped = $true; reason = "testInstall was set to false." }
+        $detectionAfterUninstall = [ordered]@{ skipped = $true; reason = "testInstall was set to false." }
     }
 
     $tool = Resolve-IntuneWinAppUtil -ToolPath $ToolPath -EnsureTool $EnsureTool -DownloadUrl $DownloadUrl
@@ -934,6 +1422,9 @@ function Invoke-IntuneWin32Package {
         packages = @($packages)
         metadata = $metadata
         installTest = $installTest
+        detectionAfterInstall = $detectionAfterInstall
+        uninstallTest = $uninstallTest
+        detectionAfterUninstall = $detectionAfterUninstall
         warning = $(if ($packages.Count -eq 0) { "No .intunewin file was found in the output folder after packaging." } else { $null })
     }
 }
@@ -1427,6 +1918,27 @@ function Invoke-AgentCommand {
             $workingDirectory = [string](Get-ArgValue $args "workingDirectory" "")
             return @{ data = (Invoke-InstallerCommandTest -Command $command -TimeoutMs $timeoutMs -LogPath $logPath -LogTailLines $logTailLines -WorkingDirectory $workingDirectory) }
         }
+        "detection_verify" {
+            $rule = Get-ArgValue $args "rule" $null
+            $expectedPresent = [bool](Get-ArgValue $args "expectedPresent" $true)
+            $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 30000)
+            return @{ data = (Test-DetectionRule -Rule $rule -ExpectedPresent $expectedPresent -TimeoutMs $timeoutMs) }
+        }
+        "job_start_ps" {
+            $command = [string](Get-ArgValue $args "command" "")
+            $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 600000)
+            $workingDirectory = [string](Get-ArgValue $args "workingDirectory" "")
+            return @{ data = (Start-SandboxPowerShellJob -Command $command -TimeoutMs $timeoutMs -WorkingDirectory $workingDirectory) }
+        }
+        "job_status" {
+            $jobId = [string](Get-ArgValue $args "jobId" "")
+            $tailLines = [int](Get-ArgValue $args "tailLines" 80)
+            return @{ data = (Get-SandboxJobStatus -JobId $jobId -TailLines $tailLines) }
+        }
+        "job_cancel" {
+            $jobId = [string](Get-ArgValue $args "jobId" "")
+            return @{ data = (Stop-SandboxJob -JobId $jobId) }
+        }
         "intune_prereqs" {
             $toolPath = [string](Get-ArgValue $args "toolPath" "")
             $ensureTool = [bool](Get-ArgValue $args "ensureTool" $true)
@@ -1439,6 +1951,7 @@ function Invoke-AgentCommand {
             $outputFolder = [string](Get-ArgValue $args "outputFolder" "")
             $installCommand = [string](Get-ArgValue $args "installCommand" "")
             $uninstallCommand = [string](Get-ArgValue $args "uninstallCommand" "")
+            $detectionRule = Get-ArgValue $args "detectionRule" $null
             $toolPath = [string](Get-ArgValue $args "toolPath" "")
             $ensureTool = [bool](Get-ArgValue $args "ensureTool" $true)
             $downloadUrl = [string](Get-ArgValue $args "downloadUrl" "")
@@ -1447,7 +1960,10 @@ function Invoke-AgentCommand {
             $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 300000)
             $testInstall = [bool](Get-ArgValue $args "testInstall" $true)
             $installTestTimeoutMs = [int](Get-ArgValue $args "installTestTimeoutMs" 90000)
-            return @{ data = (Invoke-IntuneWin32Package -SourceFolder $sourceFolder -SetupFile $setupFile -OutputFolder $outputFolder -InstallCommand $installCommand -UninstallCommand $uninstallCommand -ToolPath $toolPath -EnsureTool $ensureTool -DownloadUrl $downloadUrl -Quiet $quiet -IncludeCatalog $includeCatalog -TimeoutMs $timeoutMs -TestInstall $testInstall -InstallTestTimeoutMs $installTestTimeoutMs) }
+            $verifyDetection = [bool](Get-ArgValue $args "verifyDetection" $true)
+            $testUninstall = [bool](Get-ArgValue $args "testUninstall" $true)
+            $uninstallTestTimeoutMs = [int](Get-ArgValue $args "uninstallTestTimeoutMs" 90000)
+            return @{ data = (Invoke-IntuneWin32Package -SourceFolder $sourceFolder -SetupFile $setupFile -OutputFolder $outputFolder -InstallCommand $installCommand -UninstallCommand $uninstallCommand -DetectionRule $detectionRule -ToolPath $toolPath -EnsureTool $ensureTool -DownloadUrl $downloadUrl -Quiet $quiet -IncludeCatalog $includeCatalog -TimeoutMs $timeoutMs -TestInstall $testInstall -InstallTestTimeoutMs $installTestTimeoutMs -VerifyDetection $verifyDetection -TestUninstall $testUninstall -UninstallTestTimeoutMs $uninstallTestTimeoutMs) }
         }
         "processes" {
             $processes = Get-Process |

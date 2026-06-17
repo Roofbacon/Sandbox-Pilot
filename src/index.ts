@@ -38,6 +38,9 @@ function addBridgeHostPaths(data: any): any {
       hostPath: bridgeHostPath(pkg.bridgeRelativePath),
     }));
   }
+  if (data.paths?.bridgeRelativePath) {
+    data.paths.hostPath = bridgeHostPath(data.paths.bridgeRelativePath);
+  }
   return data;
 }
 
@@ -429,6 +432,70 @@ server.registerTool(
 );
 
 server.registerTool(
+  "sandbox_verify_detection_rule",
+  {
+    title: "Verify an Intune-style detection rule",
+    description:
+      "Evaluate a detection rule inside the Sandbox and report whether it matches the expected state. " +
+      "Supports MSI product code, registry, file/version, and PowerShell script rules. Use after install " +
+      "and after uninstall to prove Intune detection will behave as expected.",
+    inputSchema: {
+      rule: z
+        .any()
+        .describe(
+          "Detection rule object. Examples: {type:'msiProductCode', productCode:'{...}'}, {type:'registry', path:'HKLM:\\...', valueName:'DisplayVersion', operator:'equals', value:'1.2.3'}, {type:'file', path:'C:\\...', minVersion:'1.2.3'}, or {type:'script', script:'...'}",
+        ),
+      expectedPresent: z.boolean().default(true).describe("true expects detection to match; false expects it not to match."),
+      timeoutMs: z.number().int().positive().default(30000).describe("Timeout for script detection rules."),
+    },
+  },
+  async (args) => text((await sendCommand("detection_verify", args, Math.max(args.timeoutMs ?? 30000, 1000) + 5000)).data),
+);
+
+server.registerTool(
+  "sandbox_start_job",
+  {
+    title: "Start a long-running PowerShell job",
+    description:
+      "Start a PowerShell command inside the Sandbox and return immediately with a jobId. " +
+      "Use for long installers or scripts that may exceed normal MCP call timeouts, then poll with sandbox_job_status.",
+    inputSchema: {
+      command: z.string().describe("PowerShell command or script to run inside the Sandbox."),
+      timeoutMs: z.number().int().positive().default(600000).describe("Maximum runtime before sandbox_job_status marks it timed out and kills it."),
+      workingDirectory: z.string().optional().describe("Optional guest working directory to run the command from."),
+    },
+  },
+  async (args) => text(addBridgeHostPaths((await sendCommand("job_start_ps", args, 30000)).data)),
+);
+
+server.registerTool(
+  "sandbox_job_status",
+  {
+    title: "Check a Sandbox job",
+    description:
+      "Return status for a job started by sandbox_start_job, including exit code, timeout/cancel state, " +
+      "stdout/stderr tails, and host paths to the persisted job artifacts.",
+    inputSchema: {
+      jobId: z.string().describe("Job id returned by sandbox_start_job."),
+      tailLines: z.number().int().positive().default(80).describe("Number of stdout/stderr lines to include."),
+    },
+  },
+  async (args) => text(addBridgeHostPaths((await sendCommand("job_status", args, 30000)).data)),
+);
+
+server.registerTool(
+  "sandbox_job_cancel",
+  {
+    title: "Cancel a Sandbox job",
+    description: "Kill a running job started by sandbox_start_job and return its final status/log tails.",
+    inputSchema: {
+      jobId: z.string().describe("Job id returned by sandbox_start_job."),
+    },
+  },
+  async (args) => text(addBridgeHostPaths((await sendCommand("job_cancel", args, 30000)).data)),
+);
+
+server.registerTool(
   "sandbox_intune_package_from_host",
   {
     title: "Stage and package a host folder for Intune",
@@ -449,11 +516,15 @@ server.registerTool(
         .describe("Optional host folder to copy the final .intunewin package(s) into after packaging."),
       installCommand: z.string().optional().describe("Optional Intune install command to carry into the summary."),
       uninstallCommand: z.string().optional().describe("Optional Intune uninstall command to carry into the summary."),
+      detectionRule: z.any().optional().describe("Optional detection rule to verify; defaults to MSI metadata when setupFile is an MSI."),
       testInstall: z
         .boolean()
         .default(true)
         .describe("Run the install command in the Sandbox before packaging; packaging is skipped if the test fails."),
       installTestTimeoutMs: z.number().int().positive().default(90000).describe("Install preflight timeout in milliseconds."),
+      verifyDetection: z.boolean().default(true).describe("Verify the detection rule after install and, when uninstall is tested, after uninstall."),
+      testUninstall: z.boolean().default(true).describe("Run the uninstall command after a successful install/detection preflight."),
+      uninstallTestTimeoutMs: z.number().int().positive().default(90000).describe("Uninstall preflight timeout in milliseconds."),
       ensureTool: z.boolean().default(true).describe("Download the official tool if it is missing."),
       toolPath: z.string().optional().describe("Optional guest path to an existing IntuneWinAppUtil.exe."),
       downloadUrl: z
@@ -480,8 +551,12 @@ server.registerTool(
             setupFile: args.setupFile,
             installCommand: args.installCommand,
             uninstallCommand: args.uninstallCommand,
+            detectionRule: args.detectionRule,
             testInstall: args.testInstall,
             installTestTimeoutMs: args.installTestTimeoutMs,
+            verifyDetection: args.verifyDetection,
+            testUninstall: args.testUninstall,
+            uninstallTestTimeoutMs: args.uninstallTestTimeoutMs,
             ensureTool: args.ensureTool,
             toolPath: args.toolPath,
             downloadUrl: args.downloadUrl,
@@ -489,7 +564,12 @@ server.registerTool(
             includeCatalog: args.includeCatalog,
             timeoutMs: args.timeoutMs,
           },
-          Math.max(args.timeoutMs ?? 300000, args.installTestTimeoutMs ?? 90000, 1000) + 30000,
+          Math.max(
+            args.timeoutMs ?? 300000,
+            args.installTestTimeoutMs ?? 90000,
+            args.uninstallTestTimeoutMs ?? 90000,
+            1000,
+          ) + 30000,
         )
       ).data,
     );
@@ -544,11 +624,15 @@ server.registerTool(
         .describe("Guest output folder. Defaults to C:\\SandboxBridge\\artifacts\\intune."),
       installCommand: z.string().optional().describe("Optional Intune install command to carry into the summary."),
       uninstallCommand: z.string().optional().describe("Optional Intune uninstall command to carry into the summary."),
+      detectionRule: z.any().optional().describe("Optional detection rule to verify; defaults to MSI metadata when setupFile is an MSI."),
       testInstall: z
         .boolean()
         .default(true)
         .describe("Run the install command in the Sandbox before packaging; packaging is skipped if the test fails."),
       installTestTimeoutMs: z.number().int().positive().default(90000).describe("Install preflight timeout in milliseconds."),
+      verifyDetection: z.boolean().default(true).describe("Verify the detection rule after install and, when uninstall is tested, after uninstall."),
+      testUninstall: z.boolean().default(true).describe("Run the uninstall command after a successful install/detection preflight."),
+      uninstallTestTimeoutMs: z.number().int().positive().default(90000).describe("Uninstall preflight timeout in milliseconds."),
       ensureTool: z.boolean().default(true).describe("Download the official tool if it is missing."),
       toolPath: z.string().optional().describe("Optional guest path to an existing IntuneWinAppUtil.exe."),
       downloadUrl: z
@@ -570,7 +654,12 @@ server.registerTool(
             await sendCommand(
               "intune_package",
               args,
-              Math.max(args.timeoutMs ?? 300000, args.installTestTimeoutMs ?? 90000, 1000) + 30000,
+              Math.max(
+                args.timeoutMs ?? 300000,
+                args.installTestTimeoutMs ?? 90000,
+                args.uninstallTestTimeoutMs ?? 90000,
+                1000,
+              ) + 30000,
             )
           ).data,
         ),
