@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="Sandbox%20Pilot.png" alt="Sandbox Pilot logo" width="420">
+  <img src="Sandbox%20Pilot.png" alt="Sandbox Pilot logo" width="300">
 </p>
 
 # Sandbox Pilot
