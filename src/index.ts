@@ -8,6 +8,7 @@ import { annotate, bridgeInfo, runBridgeAction, stageHostPath, toBridgeHostPath,
 import * as fileBridge from "./bridge.js";
 import * as socketBridge from "./socket-bridge.js";
 import { runTestPlan } from "./testplan.js";
+import { diffSnapshots } from "./snapshot.js";
 
 // Transport: "socket" (low latency, guest listens / host connects out) or the default
 // file bridge (shared folder; simpler but ~20s host->guest propagation).
@@ -532,6 +533,51 @@ server.registerTool(
         new Date().toISOString(),
       ),
     ),
+);
+
+server.registerTool(
+  "sandbox_snapshot",
+  {
+    title: "Capture a system-state snapshot",
+    description:
+      "Capture a baseline of the Sandbox state — files under common install roots, registry values " +
+      "under install-related keys, installed programs, and services — and persist it to the shared " +
+      "bridge. Take one before an install and one after, then diff them with sandbox_diff_snapshots to " +
+      "see exactly what the installer changed (also powers uninstall-residue checks and auto-docs). " +
+      "Because a fresh Sandbox is nearly empty, an app's footprint stands out clearly. Returns a " +
+      "snapshotId, per-section counts, and host paths.",
+    inputSchema: {
+      label: z.string().optional().describe("Human-readable label, e.g. 'before-install' / 'after-install'."),
+      includeFiles: z.boolean().default(true),
+      includeRegistry: z.boolean().default(true),
+      includePrograms: z.boolean().default(true),
+      includeServices: z.boolean().default(true),
+      fileRoots: z.array(z.string()).optional().describe("Override the default file roots (Program Files, ProgramData, AppData, Start Menu, …)."),
+      registryRoots: z.array(z.string()).optional().describe("Override the default registry roots (Uninstall + Run keys)."),
+      maxFiles: z.number().int().positive().default(200000).describe("Cap on enumerated files; sets a truncated flag if hit."),
+      maxRegistryValues: z.number().int().positive().default(50000).describe("Cap on enumerated registry values; sets a truncated flag if hit."),
+    },
+  },
+  async (args) => text(addBridgeHostPaths((await sendCommand("snapshot_capture", args, 300000)).data)),
+);
+
+server.registerTool(
+  "sandbox_diff_snapshots",
+  {
+    title: "Diff two system-state snapshots",
+    description:
+      "Compare two snapshots captured by sandbox_snapshot and report what changed across files, " +
+      "registry values, installed programs, and services (added / removed / changed). Writes diff.json " +
+      "and a human-readable diff.md under bridge\\artifacts\\snapshots\\diffs\\<diffId> and returns the " +
+      "counts plus a capped inline payload. Use after install to document the footprint, or after " +
+      "uninstall (before vs a clean baseline) to find leftover residue.",
+    inputSchema: {
+      beforeId: z.string().describe("snapshotId of the earlier snapshot."),
+      afterId: z.string().describe("snapshotId of the later snapshot."),
+    },
+  },
+  async ({ beforeId, afterId }) =>
+    text(await diffSnapshots({ bridgeRoot }, beforeId, afterId, new Date().toISOString())),
 );
 
 server.registerTool(

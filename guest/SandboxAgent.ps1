@@ -16,11 +16,12 @@ $ArtifactsDir = Join-Path $BridgeRoot "artifacts"
 $ScreenshotsDir = Join-Path $ArtifactsDir "screenshots"
 $IntuneArtifactsDir = Join-Path $ArtifactsDir "intune"
 $JobsDir = Join-Path $ArtifactsDir "jobs"
+$SnapshotsDir = Join-Path $ArtifactsDir "snapshots"
 $ToolsDir = Join-Path $BridgeRoot "tools"
 $LogsDir = Join-Path $BridgeRoot "logs"
 $LogPath = Join-Path $LogsDir "sandbox-agent.log"
 
-foreach ($dir in @($CommandsDir, $ProcessedDir, $ResultsDir, $ArtifactsDir, $ScreenshotsDir, $IntuneArtifactsDir, $JobsDir, $ToolsDir, $LogsDir)) {
+foreach ($dir in @($CommandsDir, $ProcessedDir, $ResultsDir, $ArtifactsDir, $ScreenshotsDir, $IntuneArtifactsDir, $JobsDir, $SnapshotsDir, $ToolsDir, $LogsDir)) {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
 }
 
@@ -1387,6 +1388,162 @@ function Invoke-AssertionSet {
     }
 }
 
+function Get-DefaultSnapshotFileRoots {
+    $roots = @(
+        $env:ProgramFiles,
+        ${env:ProgramFiles(x86)},
+        $env:ProgramData,
+        $env:LOCALAPPDATA,
+        $env:APPDATA,
+        (Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs")
+    )
+    return @($roots | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Get-DefaultSnapshotRegistryRoots {
+    return @(
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+    )
+}
+
+function Get-FileSystemSnapshot {
+    param([string[]]$Roots, [int]$MaxFiles = 200000)
+
+    $files = New-Object System.Collections.ArrayList
+    $truncated = $false
+    foreach ($root in @($Roots)) {
+        if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
+        foreach ($item in (Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+            if ($files.Count -ge $MaxFiles) { $truncated = $true; break }
+            [void]$files.Add([ordered]@{ path = $item.FullName; size = $item.Length; mtime = $item.LastWriteTimeUtc.ToString("o") })
+        }
+        if ($truncated) { break }
+    }
+    return [ordered]@{ roots = @($Roots); count = $files.Count; truncated = $truncated; files = @($files) }
+}
+
+function Get-RegistryValuesSnapshot {
+    param([string[]]$Roots, [int]$MaxValues = 50000)
+
+    $values = New-Object System.Collections.ArrayList
+    $truncated = $false
+    foreach ($root in @($Roots)) {
+        if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
+        $keyPaths = @($root) + @(Get-ChildItem -LiteralPath $root -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PSPath)
+        foreach ($keyPath in $keyPaths) {
+            if ($values.Count -ge $MaxValues) { $truncated = $true; break }
+            $item = Get-ItemProperty -LiteralPath $keyPath -ErrorAction SilentlyContinue
+            if (-not $item) { continue }
+            $key = $keyPath -replace '^Microsoft\.PowerShell\.Core\\Registry::', ''
+            foreach ($prop in $item.PSObject.Properties) {
+                if ($prop.Name -like "PS*") { continue }
+                [void]$values.Add([ordered]@{ key = $key; name = $prop.Name; value = [string]$prop.Value })
+            }
+        }
+        if ($truncated) { break }
+    }
+    return [ordered]@{ roots = @($Roots); count = $values.Count; truncated = $truncated; values = @($values) }
+}
+
+function Get-InstalledProgramsSnapshot {
+    $registryPaths = @(
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+    $programs = foreach ($path in $registryPaths) {
+        Get-ItemProperty -Path $path -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName } |
+            ForEach-Object {
+                [ordered]@{
+                    id = [string]$_.PSChildName
+                    displayName = [string]$_.DisplayName
+                    displayVersion = [string]$_.DisplayVersion
+                    publisher = [string]$_.Publisher
+                }
+            }
+    }
+    $programs = @($programs | Sort-Object { $_.id } -Unique)
+    return [ordered]@{ count = $programs.Count; programs = @($programs) }
+}
+
+function Get-ServicesSnapshot {
+    $services = @(Get-Service -ErrorAction SilentlyContinue | ForEach-Object {
+        [ordered]@{
+            name = [string]$_.Name
+            displayName = [string]$_.DisplayName
+            status = [string]$_.Status
+            startType = [string]$_.StartType
+        }
+    })
+    return [ordered]@{ count = $services.Count; services = @($services) }
+}
+
+function New-SystemSnapshot {
+    param(
+        [string]$Label = "",
+        [string[]]$FileRoots = @(),
+        [string[]]$RegistryRoots = @(),
+        [bool]$IncludeFiles = $true,
+        [bool]$IncludeRegistry = $true,
+        [bool]$IncludePrograms = $true,
+        [bool]$IncludeServices = $true,
+        [int]$MaxFiles = 200000,
+        [int]$MaxRegistryValues = 50000
+    )
+
+    $stamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
+    $snapshotId = "$stamp-$(([guid]::NewGuid().ToString()).Substring(0,8))"
+    $root = Join-Path $SnapshotsDir $snapshotId
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+    $snapshotPath = Join-Path $root "snapshot.json"
+
+    if ($IncludeFiles -and (@($FileRoots).Count -eq 0)) { $FileRoots = Get-DefaultSnapshotFileRoots }
+    if ($IncludeRegistry -and (@($RegistryRoots).Count -eq 0)) { $RegistryRoots = Get-DefaultSnapshotRegistryRoots }
+
+    $files = $(if ($IncludeFiles) { Get-FileSystemSnapshot -Roots $FileRoots -MaxFiles $MaxFiles } else { $null })
+    $registry = $(if ($IncludeRegistry) { Get-RegistryValuesSnapshot -Roots $RegistryRoots -MaxValues $MaxRegistryValues } else { $null })
+    $programs = $(if ($IncludePrograms) { Get-InstalledProgramsSnapshot } else { $null })
+    $services = $(if ($IncludeServices) { Get-ServicesSnapshot } else { $null })
+
+    $snapshot = [ordered]@{
+        snapshotId = $snapshotId
+        label = $Label
+        createdAt = (Get-Date).ToString("o")
+        sections = [ordered]@{
+            files = $files
+            registry = $registry
+            programs = $programs
+            services = $services
+        }
+    }
+    Write-Utf8JsonFile -Path $snapshotPath -Value $snapshot
+
+    return [ordered]@{
+        snapshotId = $snapshotId
+        label = $Label
+        createdAt = $snapshot.createdAt
+        counts = [ordered]@{
+            files = $(if ($files) { $files.count } else { $null })
+            registryValues = $(if ($registry) { $registry.count } else { $null })
+            programs = $(if ($programs) { $programs.count } else { $null })
+            services = $(if ($services) { $services.count } else { $null })
+        }
+        truncated = [ordered]@{
+            files = $(if ($files) { $files.truncated } else { $false })
+            registry = $(if ($registry) { $registry.truncated } else { $false })
+        }
+        paths = [ordered]@{
+            root = $root
+            snapshot = $snapshotPath
+            bridgeRelativePath = ConvertTo-BridgeRelativePath -Path $snapshotPath
+        }
+    }
+}
+
 function Test-PackagingDetectionRule {
     param(
         $Rule,
@@ -2086,6 +2243,18 @@ function Invoke-AgentCommand {
             $assertions = Get-ArgValue $args "assertions" $null
             $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 30000)
             return @{ data = (Invoke-AssertionSet -Assertions $assertions -TimeoutMs $timeoutMs) }
+        }
+        "snapshot_capture" {
+            $label = [string](Get-ArgValue $args "label" "")
+            $fileRoots = @(Get-ArgValue $args "fileRoots" @())
+            $registryRoots = @(Get-ArgValue $args "registryRoots" @())
+            $includeFiles = [bool](Get-ArgValue $args "includeFiles" $true)
+            $includeRegistry = [bool](Get-ArgValue $args "includeRegistry" $true)
+            $includePrograms = [bool](Get-ArgValue $args "includePrograms" $true)
+            $includeServices = [bool](Get-ArgValue $args "includeServices" $true)
+            $maxFiles = [int](Get-ArgValue $args "maxFiles" 200000)
+            $maxRegistryValues = [int](Get-ArgValue $args "maxRegistryValues" 50000)
+            return @{ data = (New-SystemSnapshot -Label $label -FileRoots $fileRoots -RegistryRoots $registryRoots -IncludeFiles $includeFiles -IncludeRegistry $includeRegistry -IncludePrograms $includePrograms -IncludeServices $includeServices -MaxFiles $maxFiles -MaxRegistryValues $maxRegistryValues) }
         }
         "job_start_ps" {
             $command = [string](Get-ArgValue $args "command" "")

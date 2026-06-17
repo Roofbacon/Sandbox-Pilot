@@ -28,6 +28,7 @@ Sandbox Pilot exposes [Windows Sandbox](https://learn.microsoft.com/en-us/window
 | **Bridge files** | `sandbox_bridge_info`, `sandbox_stage_host_path` - discover the active host/guest bridge and copy host files or folders into `C:\SandboxBridge\processed` |
 | **Installers** | `sandbox_find_install_candidates`, `sandbox_msi_inspect`, `sandbox_analyze_installers`, `sandbox_test_install_command`, `sandbox_verify_detection_rule` - inspect installer payloads, infer silent commands, verify installs, and prove detection rules in the disposable VM |
 | **Test** | `sandbox_assert` (file/registry/process/service/window/installedProgram/msiProductCode/script pass-fail checks), `sandbox_run_test_plan` - run a declarative step list and emit JUnit XML + a screenshot-embedded Markdown report |
+| **Snapshot / diff** | `sandbox_snapshot`, `sandbox_diff_snapshots` - baseline files/registry/programs/services, then diff before vs after to see exactly what an installer changed (footprint docs + uninstall-residue checks) |
 | **Intune packaging** | `sandbox_intune_prereqs`, `sandbox_intune_package_win32`, `sandbox_intune_package_from_host` - test install, verify detection, test uninstall, auto-install Microsoft's Win32 Content Prep Tool if needed, and save `.intunewin` packages to shared artifacts |
 | **Long jobs** | `sandbox_start_job`, `sandbox_job_status`, `sandbox_job_cancel` - run long PowerShell operations without blocking the MCP call, with persisted stdout/stderr artifacts |
 | **Document** | `sandbox_annotate` (boxes/arrows/labels/spotlight), `sandbox_guide_step` + `sandbox_guide_build` + `sandbox_guide_reset` |
@@ -171,6 +172,12 @@ For operations that may outlive a normal MCP tool call, use `sandbox_start_job` 
   ]
 }
 ```
+
+## Footprint & residue workflow
+
+`sandbox_snapshot` captures a baseline of the Sandbox state — files under common install roots (Program Files, ProgramData, AppData, Start Menu), registry values under the Uninstall and Run keys, installed programs, and services. Capture one before an install and one after, then `sandbox_diff_snapshots` reports exactly what changed (added / removed / modified per category) and writes a human-readable `diff.md` under `bridge\artifacts\snapshots\diffs\<diffId>`. Because a fresh Sandbox is nearly empty, an app's footprint stands out clearly.
+
+The same diff doubles as an **uninstall-residue check**: snapshot a clean baseline, install, uninstall, snapshot again, and diff the post-uninstall state against the clean baseline — anything left behind shows up as added files/keys/services. The footprint diff is also useful documentation in its own right ("installing X creates these files and this service"). Both file roots and registry roots are overridable for targeted snapshots.
 
 ## Intune packaging workflow
 
