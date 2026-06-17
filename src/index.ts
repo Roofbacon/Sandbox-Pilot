@@ -350,7 +350,8 @@ server.registerTool(
     title: "Prepare a Sandbox for control",
     description:
       "One call to get a control-ready Windows Sandbox: start or reuse one, open the interactive " +
-      "session (full-size screenshots), apply Google DNS for internet, and start the guest control " +
+      "session and set a clean 1920x1080 desktop resolution (so screenshots are not a tiny postage " +
+      "stamp or microscopic), apply Google DNS for internet, and start the guest control " +
       "agent. With SANDBOX_TRANSPORT=socket this starts the socket agent and waits until it has " +
       "published its endpoint (returns ready=true); otherwise it starts the file-mode agent. " +
       "Run this once before driving the UI.",
@@ -359,6 +360,29 @@ server.registerTool(
   async () => {
     const action = process.env.SANDBOX_TRANSPORT === "socket" ? "prepare-socket" : "prepare-guide";
     return text(await runBridgeAction(action));
+  },
+);
+
+server.registerTool(
+  "sandbox_set_resolution",
+  {
+    title: "Set the guest screen resolution",
+    description:
+      "Resize the Windows Sandbox desktop to a clean, deterministic resolution (default 1920x1080). " +
+      "The guest is an RDP session whose size tracks the host window, and it sometimes boots at a tiny " +
+      "fallback (e.g. 200x200 or 640x480 — a postage-stamp desktop) or, on a high-DPI host, an enormous " +
+      "resolution where everything is microscopic. sandbox_prepare already applies this, but call it " +
+      "yourself if sandbox_health reports a small or huge screen and your screenshots look wrong.",
+    inputSchema: {
+      width: z.number().int().optional().describe("Target width in pixels (default 1920)."),
+      height: z.number().int().optional().describe("Target height in pixels (default 1080)."),
+    },
+  },
+  async ({ width, height }) => {
+    const args: string[] = [];
+    if (width != null) args.push("-Width", String(width));
+    if (height != null) args.push("-Height", String(height));
+    return text(await runBridgeAction("set-resolution", args));
   },
 );
 

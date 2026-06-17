@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("init", "start", "prepare-guide", "prepare-socket", "reload-agent", "bundle-tesseract", "connect", "attach", "attach-socket", "set-dns", "list", "send", "screenshot", "ui-tree", "center-window", "inventory", "processes", "click", "type", "paste", "set-focused-text", "key", "run-ps", "run-cmd", "open", "wait-result", "stop-agent", "clean")]
+    [ValidateSet("init", "start", "prepare-guide", "prepare-socket", "reload-agent", "bundle-tesseract", "connect", "set-resolution", "attach", "attach-socket", "set-dns", "list", "send", "screenshot", "ui-tree", "center-window", "inventory", "processes", "click", "type", "paste", "set-focused-text", "key", "run-ps", "run-cmd", "open", "wait-result", "stop-agent", "clean")]
     [string]$Action,
 
     [string]$Type,
@@ -21,6 +21,8 @@ param(
     [switch]$OnlyInteractive,
     [int]$MaxWidth = 1280,
     [int]$Quality = 70,
+    [int]$Width = 1920,
+    [int]$Height = 1080,
     [switch]$Wait
 )
 
@@ -193,6 +195,62 @@ function Connect-SandboxWindow {
     }
 }
 
+function Set-SandboxResolution {
+    # Force a deterministic guest resolution. The Windows Sandbox guest desktop is an RDP
+    # session whose size tracks the client window's client area; left to chance it boots at a
+    # tiny fallback (200x200 / 640x480 — a postage-stamp desktop) or inherits the full host
+    # resolution on a high-DPI monitor (everything microscopic). We size the host-side
+    # "Windows Sandbox" window so the guest renders at a clean, screenshot-friendly size.
+    param([int]$Width = 1920, [int]$Height = 1080, [int]$TimeoutSeconds = 12)
+
+    if (-not ([System.Management.Automation.PSTypeName]'SbxWin').Type) {
+        Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class SbxWin {
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int ht, bool repaint);
+  [DllImport("user32.dll")] public static extern IntPtr FindWindow(string c, string n);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+}
+"@
+    }
+    # DPI-aware so MoveWindow coordinates are real device pixels (matches the guest's pixels).
+    try { [SbxWin]::SetProcessDPIAware() | Out-Null } catch { }
+
+    # The client area is ~16px narrower and ~41px shorter than the guest desktop it produces
+    # (RDP chrome + non-client frame), so pad the requested guest size to get the outer window.
+    $outerW = $Width + 16
+    $outerH = $Height + 41
+
+    # The "wsb connect" window can take a few seconds to appear; poll for it.
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $hwnd = [IntPtr]::Zero
+    while ((Get-Date) -lt $deadline) {
+        $proc = Get-Process -Name "WindowsSandboxRemoteSession" -ErrorAction SilentlyContinue |
+            Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+        if ($proc) { $hwnd = $proc.MainWindowHandle; break }
+        $byTitle = [SbxWin]::FindWindow($null, "Windows Sandbox")
+        if ($byTitle -ne [IntPtr]::Zero) { $hwnd = $byTitle; break }
+        Start-Sleep -Milliseconds 500
+    }
+    if ($hwnd -eq [IntPtr]::Zero) {
+        return [pscustomobject]@{ resized = $false; reason = "Windows Sandbox window not found"; requested = @($Width, $Height) }
+    }
+
+    # Resize twice — the window is often still settling right after connect, and a second pass
+    # makes the final size stick.
+    for ($i = 0; $i -lt 2; $i++) {
+        [SbxWin]::ShowWindow($hwnd, 9) | Out-Null    # SW_RESTORE (leave maximized state)
+        Start-Sleep -Milliseconds 400
+        [SbxWin]::MoveWindow($hwnd, 40, 30, $outerW, $outerH, $true) | Out-Null
+        [SbxWin]::SetForegroundWindow($hwnd) | Out-Null
+        Start-Sleep -Milliseconds 900
+    }
+    [pscustomobject]@{ resized = $true; hwnd = [int64]$hwnd; requested = @($Width, $Height) }
+}
+
 function Set-SandboxGoogleDns {
     param([string]$TargetSandboxId)
 
@@ -236,6 +294,7 @@ function Prepare-SandboxForGuide {
 
     Connect-SandboxWindow -TargetSandboxId $targetId | Out-Null
     Start-Sleep -Seconds 4
+    try { Set-SandboxResolution | Out-Null } catch { }
     $dns = Set-SandboxGoogleDns -TargetSandboxId $targetId
     $attach = Attach-BridgeToSandbox -TargetSandboxId $targetId
 
@@ -283,12 +342,17 @@ function Prepare-SandboxForSocket {
         try { $endpoint = Get-Content -Path $endpointPath -Raw | ConvertFrom-Json } catch { }
     }
 
+    # Force a usable guest resolution (the session otherwise boots at a tiny RDP fallback).
+    $resolution = $null
+    try { $resolution = Set-SandboxResolution } catch { }
+
     [pscustomobject]@{
         sandboxId = $targetId
         connected = $true
         transport = "socket"
         dnsServers = $dns.dnsServers
         endpoint = $endpoint
+        resolution = $resolution
         ready = [bool]$endpoint
     }
 }
@@ -320,9 +384,11 @@ function Reload-SocketAgent {
     $deadline = (Get-Date).AddSeconds(45)
     while (-not (Test-Path $endpoint) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
 
-    # Killing PowerShell drops the interactive session to 200x200; reconnect for real capture.
+    # Killing PowerShell drops the interactive session to 200x200; reconnect + resize for real capture.
     Start-Process -FilePath "wsb.exe" -ArgumentList @("connect", "--id", $TargetSandboxId) | Out-Null
     Start-Sleep -Seconds 6
+    $resolution = $null
+    try { $resolution = Set-SandboxResolution } catch { }
 
     $ep = $null
     if (Test-Path $endpoint) { try { $ep = Get-Content -Path $endpoint -Raw | ConvertFrom-Json } catch { } }
@@ -331,6 +397,7 @@ function Reload-SocketAgent {
         reloaded = $true
         ready = [bool]$ep
         endpoint = $ep
+        resolution = $resolution
     }
 }
 
@@ -463,7 +530,15 @@ switch ($Action) {
         Bundle-Tesseract -TargetSandboxId $SandboxId | ConvertTo-Json -Depth 10
     }
     "connect" {
-        Connect-SandboxWindow -TargetSandboxId $SandboxId | ConvertTo-Json -Depth 10
+        $c = Connect-SandboxWindow -TargetSandboxId $SandboxId
+        Start-Sleep -Seconds 4
+        $res = $null
+        try { $res = Set-SandboxResolution -Width $Width -Height $Height } catch { }
+        $c | Add-Member -NotePropertyName resolution -NotePropertyValue $res -Force
+        $c | ConvertTo-Json -Depth 10
+    }
+    "set-resolution" {
+        Set-SandboxResolution -Width $Width -Height $Height | ConvertTo-Json -Depth 10
     }
     "attach" {
         Attach-BridgeToSandbox -TargetSandboxId $SandboxId | ConvertTo-Json -Depth 10
