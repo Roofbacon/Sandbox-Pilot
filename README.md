@@ -228,7 +228,10 @@ This downloads Tesseract on the host, installs it inside the Sandbox (elevated, 
 npm install     # installs + builds (prepare runs tsc)
 npm test        # offline unit/integration tests (no Sandbox needed)
 node smoke.mjs  # end-to-end smoke test against a running Sandbox (set SANDBOX_TRANSPORT=socket)
+node mcp-e2e.mjs  # drives the MCP server against a running Sandbox, exercising health/assert/snapshot/diff/test-plan/record/guide/cleanup
 ```
+
+> `mcp-e2e.mjs` boots nothing itself — run `.\host\SandboxBridge.ps1 prepare-socket` (and `reload-agent` after editing the guest agent) first, then it connects an MCP client to `dist/index.js` and checks each feature against the live VM.
 
 After editing the guest agent, redeploy to a running Sandbox in one command:
 

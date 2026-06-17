@@ -1188,11 +1188,15 @@ function Test-MsiProductDetection {
         "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
     )
     # NB: do not name this $matches - that is a PowerShell automatic variable populated by -match.
+    # Access optional properties via Get-ObjectPropertyValue - Set-StrictMode 2.0 throws on a
+    # direct $_.UninstallString when the uninstall key has no such value.
     $found = foreach ($path in $registryPaths) {
         Get-ItemProperty -Path $path -ErrorAction SilentlyContinue |
             Where-Object {
-                ($_.PSChildName -eq $ProductCode) -or
-                ($_.UninstallString -and ([string]$_.UninstallString).IndexOf($ProductCode, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+                $childName = [string](Get-ObjectPropertyValue -Object $_ -Name "PSChildName")
+                $uninstall = [string](Get-ObjectPropertyValue -Object $_ -Name "UninstallString")
+                ($childName -eq $ProductCode) -or
+                ($uninstall -and $uninstall.IndexOf($ProductCode, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
             } |
             Select-Object PSPath, PSChildName, DisplayName, DisplayVersion, Publisher, UninstallString
     }
@@ -1397,7 +1401,10 @@ function Test-InstalledProgramAssertion {
     )
     $found = foreach ($path in $registryPaths) {
         Get-ItemProperty -Path $path -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -and ([string]$_.DisplayName).IndexOf($name, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 } |
+            Where-Object {
+                $displayName = [string](Get-ObjectPropertyValue -Object $_ -Name "DisplayName")
+                $displayName -and $displayName.IndexOf($name, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+            } |
             Select-Object DisplayName, DisplayVersion, Publisher
     }
     $found = @($found)
@@ -1551,13 +1558,13 @@ function Get-InstalledProgramsSnapshot {
     )
     $programs = foreach ($path in $registryPaths) {
         Get-ItemProperty -Path $path -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName } |
+            Where-Object { Get-ObjectPropertyValue -Object $_ -Name "DisplayName" } |
             ForEach-Object {
                 [ordered]@{
-                    id = [string]$_.PSChildName
-                    displayName = [string]$_.DisplayName
-                    displayVersion = [string]$_.DisplayVersion
-                    publisher = [string]$_.Publisher
+                    id = [string](Get-ObjectPropertyValue -Object $_ -Name "PSChildName")
+                    displayName = [string](Get-ObjectPropertyValue -Object $_ -Name "DisplayName")
+                    displayVersion = [string](Get-ObjectPropertyValue -Object $_ -Name "DisplayVersion")
+                    publisher = [string](Get-ObjectPropertyValue -Object $_ -Name "Publisher")
                 }
             }
     }
