@@ -14,10 +14,12 @@ $ProcessedDir = Join-Path $BridgeRoot "processed"
 $ResultsDir = Join-Path $BridgeRoot "results"
 $ArtifactsDir = Join-Path $BridgeRoot "artifacts"
 $ScreenshotsDir = Join-Path $ArtifactsDir "screenshots"
+$IntuneArtifactsDir = Join-Path $ArtifactsDir "intune"
+$ToolsDir = Join-Path $BridgeRoot "tools"
 $LogsDir = Join-Path $BridgeRoot "logs"
 $LogPath = Join-Path $LogsDir "sandbox-agent.log"
 
-foreach ($dir in @($CommandsDir, $ProcessedDir, $ResultsDir, $ArtifactsDir, $ScreenshotsDir, $LogsDir)) {
+foreach ($dir in @($CommandsDir, $ProcessedDir, $ResultsDir, $ArtifactsDir, $ScreenshotsDir, $IntuneArtifactsDir, $ToolsDir, $LogsDir)) {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
 }
 
@@ -581,6 +583,299 @@ function Invoke-InstallerCommandTest {
     }
 }
 
+function ConvertTo-BridgeRelativePath {
+    param([string]$Path)
+
+    try {
+        $resolved = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
+    }
+    catch {
+        $resolved = [System.IO.Path]::GetFullPath($Path)
+    }
+    $root = [System.IO.Path]::GetFullPath($BridgeRoot).TrimEnd('\')
+    if ($resolved.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $resolved.Substring($root.Length).TrimStart('\')
+    }
+    return $null
+}
+
+function ConvertTo-CliArgument {
+    param([string]$Value)
+
+    if ($null -eq $Value) { return '""' }
+    if ($Value -match '^[A-Za-z0-9_\-\.=:/\\]+$') { return $Value }
+    return '"' + ($Value -replace '"', '\"') + '"'
+}
+
+function Invoke-CapturedProcess {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments = @(),
+        [int]$TimeoutMs = 120000
+    )
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    $psi.Arguments = (($Arguments | ForEach-Object { ConvertTo-CliArgument $_ }) -join " ")
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+
+    $process = [System.Diagnostics.Process]::Start($psi)
+    $completed = $process.WaitForExit($TimeoutMs)
+    $timedOut = -not $completed
+    if ($timedOut) {
+        try { & taskkill.exe /PID $process.Id /T /F | Out-Null } catch { try { $process.Kill() } catch { } }
+    }
+    $stdout = ""
+    $stderr = ""
+    try { $stdout = $process.StandardOutput.ReadToEnd() } catch { }
+    try { $stderr = $process.StandardError.ReadToEnd() } catch { }
+    $exitCode = $null
+    if (-not $timedOut) { $exitCode = $process.ExitCode }
+
+    return [ordered]@{
+        filePath = $FilePath
+        arguments = @($Arguments)
+        commandLine = $FilePath + " " + $psi.Arguments
+        timedOut = $timedOut
+        timeoutMs = $TimeoutMs
+        exitCode = $exitCode
+        stdout = $stdout
+        stderr = $stderr
+    }
+}
+
+function Get-IntuneToolVersion {
+    param([string]$ToolPath)
+
+    if (-not (Test-Path -LiteralPath $ToolPath)) { return $null }
+    try {
+        $result = Invoke-CapturedProcess -FilePath $ToolPath -Arguments @("-v") -TimeoutMs 15000
+        $text = (($result.stdout + "`n" + $result.stderr) -replace '\s+', ' ').Trim()
+        if ($text.Length -gt 300) { $text = $text.Substring(0, 300) }
+        return $text
+    }
+    catch {
+        return $null
+    }
+}
+
+function Resolve-IntuneWinAppUtil {
+    param(
+        [string]$ToolPath = "",
+        [bool]$EnsureTool = $true,
+        [string]$DownloadUrl = ""
+    )
+
+    $defaultUrl = "https://raw.githubusercontent.com/microsoft/Microsoft-Win32-Content-Prep-Tool/master/IntuneWinAppUtil.exe"
+    if (-not $DownloadUrl) { $DownloadUrl = $defaultUrl }
+
+    $searched = New-Object System.Collections.ArrayList
+    $downloaded = $false
+    $chosen = $null
+    $candidates = @()
+    if ($ToolPath) { $candidates += $ToolPath }
+    $candidates += (Join-Path $ToolsDir "IntuneWinAppUtil.exe")
+    $candidates += (Join-Path (Get-DefaultDownloadsPath) "IntuneWinAppUtil.exe")
+    $candidates += (Join-Path $env:TEMP "IntuneWinAppUtil.exe")
+
+    foreach ($candidate in $candidates) {
+        [void]$searched.Add($candidate)
+        if (Test-Path -LiteralPath $candidate) {
+            $chosen = (Resolve-Path -LiteralPath $candidate).Path
+            break
+        }
+    }
+
+    if (-not $chosen -and $EnsureTool) {
+        if ($DownloadUrl -notmatch '^https://(raw\.githubusercontent\.com|github\.com)/microsoft/Microsoft-Win32-Content-Prep-Tool/') {
+            throw "Refusing to auto-download IntuneWinAppUtil.exe from a non-Microsoft GitHub URL: $DownloadUrl"
+        }
+        $chosen = Join-Path $ToolsDir "IntuneWinAppUtil.exe"
+        $tmp = $chosen + ".download"
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        }
+        catch { }
+        Invoke-WebRequest -Uri $DownloadUrl -OutFile $tmp -UseBasicParsing
+        Move-Item -Force -LiteralPath $tmp -Destination $chosen
+        $downloaded = $true
+    }
+
+    if (-not $chosen) {
+        return [ordered]@{
+            available = $false
+            path = $null
+            bridgeRelativePath = $null
+            downloaded = $false
+            searched = @($searched)
+            downloadUrl = $DownloadUrl
+            version = $null
+            licenseNote = "Download and use of IntuneWinAppUtil.exe is governed by Microsoft's Win32 Content Prep Tool license terms."
+        }
+    }
+
+    return [ordered]@{
+        available = $true
+        path = $chosen
+        bridgeRelativePath = ConvertTo-BridgeRelativePath -Path $chosen
+        downloaded = $downloaded
+        searched = @($searched)
+        downloadUrl = $(if ($downloaded) { $DownloadUrl } else { $null })
+        version = Get-IntuneToolVersion -ToolPath $chosen
+        licenseNote = "Download and use of IntuneWinAppUtil.exe is governed by Microsoft's Win32 Content Prep Tool license terms."
+    }
+}
+
+function Resolve-SetupFileForIntune {
+    param([string]$SourceFolder, [string]$SetupFile)
+
+    if (-not $SetupFile) { throw "setupFile is required." }
+    $source = (Resolve-Path -LiteralPath $SourceFolder).Path
+    $setupPath = $SetupFile
+    if (-not [System.IO.Path]::IsPathRooted($setupPath)) {
+        $setupPath = Join-Path $source $setupPath
+    }
+    if (-not (Test-Path -LiteralPath $setupPath)) { throw "Setup file does not exist: $setupPath" }
+    $resolvedSetup = (Resolve-Path -LiteralPath $setupPath).Path
+    if (-not $resolvedSetup.StartsWith($source.TrimEnd('\') + "\", [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "setupFile must be inside sourceFolder so IntuneWinAppUtil can package it."
+    }
+    return [ordered]@{
+        path = $resolvedSetup
+        relative = $resolvedSetup.Substring($source.TrimEnd('\').Length + 1)
+        file = [System.IO.Path]::GetFileName($resolvedSetup)
+        extension = [System.IO.Path]::GetExtension($resolvedSetup).ToLowerInvariant()
+    }
+}
+
+function Get-IntunePackagingMetadata {
+    param(
+        [string]$SetupPath,
+        [string]$InstallCommand = "",
+        [string]$UninstallCommand = ""
+    )
+
+    $extension = [System.IO.Path]::GetExtension($SetupPath).ToLowerInvariant()
+    $detection = $null
+    $suggestedInstall = $InstallCommand
+    $suggestedUninstall = $UninstallCommand
+    $returnCodes = @(
+        [ordered]@{ code = 0; type = "success" },
+        [ordered]@{ code = 1707; type = "success" },
+        [ordered]@{ code = 3010; type = "softReboot" },
+        [ordered]@{ code = 1641; type = "hardReboot" },
+        [ordered]@{ code = 1618; type = "retry" }
+    )
+
+    if ($extension -eq ".msi") {
+        try {
+            $msi = Get-MsiInfo -Path $SetupPath
+            if (-not $suggestedInstall) {
+                $suggestedInstall = "msiexec /i " + (ConvertTo-InstallerCommandLiteral ([System.IO.Path]::GetFileName($SetupPath))) + " /qn /norestart"
+            }
+            if (-not $suggestedUninstall -and $msi.productCode) {
+                $suggestedUninstall = "msiexec /x " + $msi.productCode + " /qn /norestart"
+            }
+            $detection = [ordered]@{
+                type = "msiProductCode"
+                productCode = $msi.productCode
+                productVersion = $msi.productVersion
+                productName = $msi.productName
+                rule = "Use MSI product code detection in Intune."
+            }
+        }
+        catch {
+            $detection = [ordered]@{ type = "msi"; error = $_.Exception.Message }
+        }
+    }
+    else {
+        if (-not $suggestedInstall) {
+            $suggestedInstall = (ConvertTo-InstallerCommandLiteral ([System.IO.Path]::GetFileName($SetupPath))) + " /quiet /norestart"
+        }
+        $detection = [ordered]@{
+            type = "registryOrFile"
+            rule = "EXE installers need an app-specific detection rule. Prefer the uninstall registry key after a test install; fall back to a versioned file path."
+        }
+    }
+
+    return [ordered]@{
+        installCommand = $suggestedInstall
+        uninstallCommand = $suggestedUninstall
+        detection = $detection
+        returnCodes = @($returnCodes)
+    }
+}
+
+function Invoke-IntuneWin32Package {
+    param(
+        [string]$SourceFolder,
+        [string]$SetupFile,
+        [string]$OutputFolder = "",
+        [string]$InstallCommand = "",
+        [string]$UninstallCommand = "",
+        [string]$ToolPath = "",
+        [bool]$EnsureTool = $true,
+        [string]$DownloadUrl = "",
+        [bool]$Quiet = $true,
+        [bool]$IncludeCatalog = $false,
+        [int]$TimeoutMs = 300000
+    )
+
+    if (-not $SourceFolder) { throw "sourceFolder is required." }
+    if (-not (Test-Path -LiteralPath $SourceFolder)) { throw "sourceFolder does not exist: $SourceFolder" }
+    $resolvedSource = (Resolve-Path -LiteralPath $SourceFolder).Path
+    if (-not $OutputFolder) { $OutputFolder = $IntuneArtifactsDir }
+    New-Item -ItemType Directory -Force -Path $OutputFolder | Out-Null
+    $resolvedOutput = (Resolve-Path -LiteralPath $OutputFolder).Path
+    $setup = Resolve-SetupFileForIntune -SourceFolder $resolvedSource -SetupFile $SetupFile
+    $tool = Resolve-IntuneWinAppUtil -ToolPath $ToolPath -EnsureTool $EnsureTool -DownloadUrl $DownloadUrl
+    if (-not $tool.available) { throw "IntuneWinAppUtil.exe was not found. Pass ensureTool=true to download it or provide toolPath." }
+
+    $sourceRoot = [System.IO.Path]::GetFullPath($resolvedSource).TrimEnd('\')
+    $toolRoot = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($tool.path)).TrimEnd('\')
+    if ($toolRoot.StartsWith($sourceRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "IntuneWinAppUtil.exe is inside sourceFolder. Move it outside the source folder so it is not included in the package."
+    }
+    $outputRoot = [System.IO.Path]::GetFullPath($resolvedOutput).TrimEnd('\')
+    if ($outputRoot.StartsWith($sourceRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "outputFolder is inside sourceFolder. Choose an output folder outside the source folder so generated packages are not included."
+    }
+
+    $started = Get-Date
+    $arguments = @("-c", $resolvedSource, "-s", $setup.relative, "-o", $resolvedOutput)
+    if ($Quiet) { $arguments += "-q" }
+    if ($IncludeCatalog) { $arguments += "-a" }
+    $process = Invoke-CapturedProcess -FilePath $tool.path -Arguments $arguments -TimeoutMs $TimeoutMs
+    $packages = @(Get-ChildItem -LiteralPath $resolvedOutput -Filter *.intunewin -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -ge $started.AddSeconds(-2) } |
+            Sort-Object LastWriteTime -Descending |
+            ForEach-Object {
+                [ordered]@{
+                    guestPath = $_.FullName
+                    bridgeRelativePath = ConvertTo-BridgeRelativePath -Path $_.FullName
+                    file = $_.Name
+                    size = $_.Length
+                    lastWriteTime = $_.LastWriteTime.ToString("o")
+                }
+            })
+    $metadata = Get-IntunePackagingMetadata -SetupPath $setup.path -InstallCommand $InstallCommand -UninstallCommand $UninstallCommand
+
+    return [ordered]@{
+        sourceFolder = $resolvedSource
+        setupFile = $setup.relative
+        outputFolder = $resolvedOutput
+        tool = $tool
+        process = $process
+        succeeded = ((-not $process.timedOut) -and ($process.exitCode -eq 0) -and ($packages.Count -gt 0))
+        packages = @($packages)
+        metadata = $metadata
+        warning = $(if ($packages.Count -eq 0) { "No .intunewin file was found in the output folder after packaging." } else { $null })
+    }
+}
+
 function Invoke-MouseClick {
     param(
         [int]$X,
@@ -1068,6 +1363,26 @@ function Invoke-AgentCommand {
             $logPath = [string](Get-ArgValue $args "logPath" "")
             $logTailLines = [int](Get-ArgValue $args "logTailLines" 80)
             return @{ data = (Invoke-InstallerCommandTest -Command $command -TimeoutMs $timeoutMs -LogPath $logPath -LogTailLines $logTailLines) }
+        }
+        "intune_prereqs" {
+            $toolPath = [string](Get-ArgValue $args "toolPath" "")
+            $ensureTool = [bool](Get-ArgValue $args "ensureTool" $true)
+            $downloadUrl = [string](Get-ArgValue $args "downloadUrl" "")
+            return @{ data = (Resolve-IntuneWinAppUtil -ToolPath $toolPath -EnsureTool $ensureTool -DownloadUrl $downloadUrl) }
+        }
+        "intune_package" {
+            $sourceFolder = [string](Get-ArgValue $args "sourceFolder" "")
+            $setupFile = [string](Get-ArgValue $args "setupFile" "")
+            $outputFolder = [string](Get-ArgValue $args "outputFolder" "")
+            $installCommand = [string](Get-ArgValue $args "installCommand" "")
+            $uninstallCommand = [string](Get-ArgValue $args "uninstallCommand" "")
+            $toolPath = [string](Get-ArgValue $args "toolPath" "")
+            $ensureTool = [bool](Get-ArgValue $args "ensureTool" $true)
+            $downloadUrl = [string](Get-ArgValue $args "downloadUrl" "")
+            $quiet = [bool](Get-ArgValue $args "quiet" $true)
+            $includeCatalog = [bool](Get-ArgValue $args "includeCatalog" $false)
+            $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 300000)
+            return @{ data = (Invoke-IntuneWin32Package -SourceFolder $sourceFolder -SetupFile $setupFile -OutputFolder $outputFolder -InstallCommand $installCommand -UninstallCommand $uninstallCommand -ToolPath $toolPath -EnsureTool $ensureTool -DownloadUrl $downloadUrl -Quiet $quiet -IncludeCatalog $includeCatalog -TimeoutMs $timeoutMs) }
         }
         "processes" {
             $processes = Get-Process |

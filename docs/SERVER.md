@@ -37,6 +37,8 @@ Or use the repo-root helper, which also prints your MCP client config: `..\setup
 | `sandbox_msi_inspect` | Inspect MSI Product metadata, public properties, notable reboot/config flags, and suggest a silent `msiexec /qn` command. |
 | `sandbox_analyze_installers` | Analyze an installer folder or extracted vendor bundle; returns entry points, MSI metadata, script evidence, recommended commands, and notes. |
 | `sandbox_test_install_command` | Run a proposed silent install command with a timeout and collect exit code, windows, new installed programs, pending reboot state, and log tails. |
+| `sandbox_intune_prereqs` | Find or download Microsoft's IntuneWinAppUtil.exe into the shared `tools` folder and report version/source information. |
+| `sandbox_intune_package_win32` | Run IntuneWinAppUtil.exe to create a `.intunewin` package, saved by default under shared `artifacts/intune`, with host paths and deployment metadata suggestions. |
 | `sandbox_center_window` | Center the foreground window for clean screenshots. |
 | `sandbox_annotate` | Draw boxes/arrows/labels/spotlight on a screenshot (screen or image coords; screen mode is capture-offset aware, so window/region shots annotate correctly). |
 | `sandbox_guide_step` / `sandbox_guide_build` / `sandbox_guide_reset` | Record captioned (optionally annotated) screenshot steps into a named guide, then assemble them into a Markdown document with embedded images. |

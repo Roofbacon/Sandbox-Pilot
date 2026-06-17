@@ -23,6 +23,25 @@ const text = (value: unknown) => ({
   content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
 });
 
+function bridgeHostPath(relativePath?: string | null): string | null {
+  if (!relativePath) return null;
+  return path.join(bridgeRoot, ...relativePath.split(/[\\/]+/).filter(Boolean));
+}
+
+function addBridgeHostPaths(data: any): any {
+  if (!data || typeof data !== "object") return data;
+  if (data.tool?.bridgeRelativePath) {
+    data.tool.hostPath = bridgeHostPath(data.tool.bridgeRelativePath);
+  }
+  if (Array.isArray(data.packages)) {
+    data.packages = data.packages.map((pkg: any) => ({
+      ...pkg,
+      hostPath: bridgeHostPath(pkg.bridgeRelativePath),
+    }));
+  }
+  return data;
+}
+
 // ---- Sensing -------------------------------------------------------------
 
 server.registerTool(
@@ -333,6 +352,70 @@ server.registerTool(
           Math.max(args.timeoutMs ?? 120000, 1000) + 30000,
         )
       ).data,
+    ),
+);
+
+server.registerTool(
+  "sandbox_intune_prereqs",
+  {
+    title: "Resolve Intune Win32 packaging tool",
+    description:
+      "Check for IntuneWinAppUtil.exe in the Sandbox shared tools folder, Downloads, or TEMP. " +
+      "With ensureTool=true, download it from Microsoft's official Win32 Content Prep Tool GitHub repo " +
+      "into the shared tools folder so it can be reused.",
+    inputSchema: {
+      ensureTool: z.boolean().default(true).describe("Download the official tool if it is missing."),
+      toolPath: z.string().optional().describe("Optional guest path to an existing IntuneWinAppUtil.exe."),
+      downloadUrl: z
+        .string()
+        .optional()
+        .describe("Optional Microsoft GitHub URL override. Defaults to the official raw IntuneWinAppUtil.exe URL."),
+    },
+  },
+  async ({ ensureTool, toolPath, downloadUrl }) =>
+    text(addBridgeHostPaths((await sendCommand("intune_prereqs", { ensureTool, toolPath, downloadUrl }, 120000)).data)),
+);
+
+server.registerTool(
+  "sandbox_intune_package_win32",
+  {
+    title: "Package a Win32 app for Intune",
+    description:
+      "Create a .intunewin package inside the Sandbox using IntuneWinAppUtil.exe. " +
+      "The tool can auto-download the official Microsoft utility if needed, keeps it outside the source folder, " +
+      "writes packages to the shared bridge artifacts/intune folder by default, and returns host paths plus " +
+      "deployment metadata suggestions such as install/uninstall commands, detection rule, and return codes.",
+    inputSchema: {
+      sourceFolder: z.string().describe("Guest folder containing all source files to package."),
+      setupFile: z.string().describe("Setup file inside sourceFolder, relative path preferred."),
+      outputFolder: z
+        .string()
+        .optional()
+        .describe("Guest output folder. Defaults to C:\\SandboxBridge\\artifacts\\intune."),
+      installCommand: z.string().optional().describe("Optional Intune install command to carry into the summary."),
+      uninstallCommand: z.string().optional().describe("Optional Intune uninstall command to carry into the summary."),
+      ensureTool: z.boolean().default(true).describe("Download the official tool if it is missing."),
+      toolPath: z.string().optional().describe("Optional guest path to an existing IntuneWinAppUtil.exe."),
+      downloadUrl: z
+        .string()
+        .optional()
+        .describe("Optional Microsoft GitHub URL override. Defaults to the official raw IntuneWinAppUtil.exe URL."),
+      quiet: z.boolean().default(true).describe("Pass -q to IntuneWinAppUtil.exe."),
+      includeCatalog: z.boolean().default(false).describe("Pass -a to include catalog files."),
+      timeoutMs: z.number().int().positive().default(300000).describe("Packaging timeout in milliseconds."),
+    },
+  },
+  async (args) =>
+    text(
+      addBridgeHostPaths(
+        (
+          await sendCommand(
+            "intune_package",
+            args,
+            Math.max(args.timeoutMs ?? 300000, 1000) + 30000,
+          )
+        ).data,
+      ),
     ),
 );
 
