@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("init", "start", "prepare-guide", "prepare-socket", "reload-agent", "bundle-tesseract", "connect", "set-resolution", "attach", "attach-socket", "set-dns", "list", "send", "screenshot", "ui-tree", "center-window", "inventory", "processes", "click", "type", "paste", "set-focused-text", "key", "run-ps", "run-cmd", "open", "wait-result", "stop-agent", "clean")]
+    [ValidateSet("init", "start", "prepare-guide", "prepare-socket", "reload-agent", "bundle-tesseract", "connect", "set-resolution", "attach", "attach-socket", "set-dns", "list", "send", "screenshot", "ui-tree", "center-window", "inventory", "processes", "click", "type", "paste", "set-focused-text", "key", "run-ps", "run-cmd", "open", "wait-result", "stop", "stop-agent", "clean")]
     [string]$Action,
 
     [string]$Type,
@@ -23,6 +23,7 @@ param(
     [int]$Quality = 70,
     [int]$Width = 1920,
     [int]$Height = 1080,
+    [switch]$Fresh,
     [switch]$Wait
 )
 
@@ -128,6 +129,40 @@ function Get-DefaultSandboxId {
     }
 
     throw "No running Windows Sandbox session found. Start one first or run the start action."
+}
+
+function Stop-Sandbox {
+    # Destroy the Sandbox VM (a real reset — all guest state is wiped). `wsb` starts the VM
+    # detached, so closing the interactive window only closes the viewer; the VM keeps running
+    # until it is explicitly stopped here. With no -TargetSandboxId, stops every running one.
+    param([string]$TargetSandboxId)
+
+    $ids = @()
+    if ($TargetSandboxId) {
+        $ids = @($TargetSandboxId)
+    }
+    else {
+        $list = Get-RunningSandboxes
+        if ($list.WindowsSandboxEnvironments) {
+            $ids = @($list.WindowsSandboxEnvironments | ForEach-Object { [string]$_.Id })
+        }
+    }
+
+    $stopped = @()
+    foreach ($id in $ids) {
+        if (-not $id) { continue }
+        & wsb stop --id $id 2>&1 | Out-Null
+        $stopped += $id
+    }
+
+    # Drop the stale endpoint so the next prepare waits for a fresh one rather than reusing it.
+    $endpointPath = Join-Path $ResultsDir "agent-endpoint.json"
+    if (Test-Path $endpointPath) { Remove-Item -Force $endpointPath -ErrorAction SilentlyContinue }
+
+    [pscustomobject]@{
+        stopped = $stopped
+        count = $stopped.Count
+    }
 }
 
 function Attach-BridgeToSandbox {
@@ -280,7 +315,11 @@ function Set-SandboxGoogleDns {
 }
 
 function Prepare-SandboxForGuide {
+    param([switch]$Fresh)
     Initialize-Bridge | Out-Null
+
+    # -Fresh: destroy any running Sandbox first so we boot a clean VM (no leftover state).
+    if ($Fresh) { Stop-Sandbox | Out-Null; Start-Sleep -Seconds 2 }
 
     $list = Get-RunningSandboxes
     if ($list.WindowsSandboxEnvironments -and $list.WindowsSandboxEnvironments.Count -gt 0) {
@@ -309,7 +348,11 @@ function Prepare-SandboxForGuide {
 }
 
 function Prepare-SandboxForSocket {
+    param([switch]$Fresh)
     Initialize-Bridge | Out-Null
+
+    # -Fresh: destroy any running Sandbox first so we boot a clean VM (no leftover state).
+    if ($Fresh) { Stop-Sandbox | Out-Null; Start-Sleep -Seconds 2 }
 
     $list = Get-RunningSandboxes
     if ($list.WindowsSandboxEnvironments -and $list.WindowsSandboxEnvironments.Count -gt 0) {
@@ -518,10 +561,10 @@ switch ($Action) {
         Start-SandboxWithAgent | ConvertTo-Json -Depth 10
     }
     "prepare-guide" {
-        Prepare-SandboxForGuide | ConvertTo-Json -Depth 10
+        Prepare-SandboxForGuide -Fresh:$Fresh | ConvertTo-Json -Depth 10
     }
     "prepare-socket" {
-        Prepare-SandboxForSocket | ConvertTo-Json -Depth 10
+        Prepare-SandboxForSocket -Fresh:$Fresh | ConvertTo-Json -Depth 10
     }
     "reload-agent" {
         Reload-SocketAgent -TargetSandboxId $SandboxId | ConvertTo-Json -Depth 10
@@ -605,6 +648,9 @@ switch ($Action) {
     "wait-result" {
         if (-not $Id) { throw "Use -Id with the wait-result action." }
         Wait-BridgeResult -CommandId $Id -Timeout $TimeoutSeconds | ConvertTo-Json -Depth 20
+    }
+    "stop" {
+        Stop-Sandbox -TargetSandboxId $SandboxId | ConvertTo-Json -Depth 10
     }
     "stop-agent" {
         Send-BridgeCommand -CommandType "stop_agent" -WaitForResult:$Wait -Timeout $TimeoutSeconds | ConvertTo-Json -Depth 20

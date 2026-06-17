@@ -354,13 +354,36 @@ server.registerTool(
       "stamp or microscopic), apply Google DNS for internet, and start the guest control " +
       "agent. With SANDBOX_TRANSPORT=socket this starts the socket agent and waits until it has " +
       "published its endpoint (returns ready=true); otherwise it starts the file-mode agent. " +
-      "Run this once before driving the UI.",
-    inputSchema: {},
+      "By default it REUSES an already-running Sandbox (fast — no ~60s boot), so guest state from " +
+      "an earlier session persists. Pass fresh=true to destroy any running Sandbox first and boot a " +
+      "clean one. Run this once before driving the UI.",
+    inputSchema: {
+      fresh: z
+        .boolean()
+        .optional()
+        .describe("Destroy any running Sandbox first and boot a clean VM (no leftover state)."),
+    },
   },
-  async () => {
+  async ({ fresh }) => {
     const action = process.env.SANDBOX_TRANSPORT === "socket" ? "prepare-socket" : "prepare-guide";
-    return text(await runBridgeAction(action));
+    return text(await runBridgeAction(action, fresh ? ["-Fresh"] : []));
   },
+);
+
+server.registerTool(
+  "sandbox_stop",
+  {
+    title: "Stop (reset) the Sandbox",
+    description:
+      "Destroy the Windows Sandbox VM — a real reset that wipes all guest state. Because wsb starts " +
+      "the VM detached, closing the interactive window only closes the viewer; the VM keeps running " +
+      "until stopped here. With no id, stops every running Sandbox. After this, sandbox_prepare boots " +
+      "a clean one.",
+    inputSchema: {
+      id: z.string().optional().describe("Specific Sandbox id to stop. Omit to stop all running ones."),
+    },
+  },
+  async ({ id }) => text(await runBridgeAction("stop", id ? ["-SandboxId", id] : [])),
 );
 
 server.registerTool(

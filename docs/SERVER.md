@@ -21,7 +21,9 @@ Or use the repo-root helper, which also prints your MCP client config: `..\setup
 |---|---|
 | `sandbox_health` | Liveness probe: agent responds, transport, pid, screen size, headless flag, foreground window. |
 | `sandbox_status` | List running Sandboxes (wsb). |
-| `sandbox_prepare` | One call: start/reuse a Sandbox, open the interactive session, set DNS, and start the control agent (socket agent + wait for its endpoint when `SANDBOX_TRANSPORT=socket`). |
+| `sandbox_prepare` | One call: start/reuse a Sandbox, open the interactive session, pin a clean 1920×1080 resolution, set DNS, and start the control agent (socket agent + wait for its endpoint when `SANDBOX_TRANSPORT=socket`). Reuses a running Sandbox by default; pass `fresh=true` to destroy it first and boot clean. |
+| `sandbox_stop` | Destroy the Sandbox VM — a real reset that wipes all guest state (omit `id` to stop all). `wsb` runs the VM detached, so closing the window only closes the viewer; the VM persists until stopped here. |
+| `sandbox_set_resolution` | Resize the guest desktop to a deterministic resolution (default 1920×1080). `sandbox_prepare` applies this automatically; call it if `sandbox_health` reports a tiny/huge screen. |
 | `sandbox_screenshot` | Downscaled JPEG of the full screen, a `region` [x,y,w,h], or the foreground `window`; returned inline + scale/offset metadata. (The folder auto-rotates to the most recent ~40.) |
 | `sandbox_ui_tree` | UI Automation tree with real-pixel `click` points (foreground window or desktop). |
 | `sandbox_invoke` | Actuate a control by name/automationId via UIA patterns (Invoke/Toggle/Select/Expand/SetValue) — no coordinates; prefers the match that supports the action; coordinate-click fallback. |

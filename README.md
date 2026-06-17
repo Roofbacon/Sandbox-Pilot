@@ -23,10 +23,12 @@ Sandbox Pilot exposes [Windows Sandbox](https://learn.microsoft.com/en-us/window
 |---|---|
 | **Sense** | `sandbox_screenshot` (full screen / region / foreground window, inline JPEG), `sandbox_ui_tree` (UIA tree with real-pixel click points), `sandbox_ocr` (Windows OCR + bundled Tesseract fallback), `sandbox_health` |
 | **Act (UIA)** | `sandbox_invoke` — actuate a control by name/automationId via Invoke / Toggle / Select / Expand / SetValue (no coordinates, no focus fuss) |
-| **Act (input)** | `sandbox_click`, `sandbox_double_click`, `sandbox_scroll`, `sandbox_drag`, `sandbox_type`, `sandbox_key`, `sandbox_open`, `sandbox_run_ps`, `sandbox_center_window` |
+| **Act (input)** | `sandbox_click`, `sandbox_double_click`, `sandbox_scroll`, `sandbox_drag`, `sandbox_type`, `sandbox_key`, `sandbox_open`, `sandbox_run_ps`, `sandbox_center_window`, `sandbox_set_resolution` |
 | **Synchronize** | `sandbox_wait_for` — block until a UI element appears/disappears (no guessed sleeps) |
 | **Document** | `sandbox_annotate` (boxes/arrows/labels/spotlight), `sandbox_guide_step` + `sandbox_guide_build` + `sandbox_guide_reset` |
-| **Lifecycle** | `sandbox_prepare` (one call to a control-ready Sandbox), `sandbox_status` |
+| **Lifecycle** | `sandbox_prepare` (one call to a control-ready Sandbox; `fresh=true` to force a clean boot), `sandbox_stop` (reset — destroy the VM), `sandbox_status` |
+
+> **Reset semantics.** `wsb` runs the Sandbox VM detached, so closing the interactive window only closes the *viewer* — the VM (and all its guest state) keeps running. `sandbox_prepare` reuses a running Sandbox by default (no ~60s boot), which means state persists between sessions. Call `sandbox_stop` (or `sandbox_prepare` with `fresh=true`) to actually destroy the VM and start clean. The guest desktop is also pinned to a clean **1920×1080** on prepare, since the RDP session otherwise boots at a tiny or microscopic resolution.
 
 > Example output: the guide builder turns a sequence of captioned, annotated screenshots into a Markdown document.
 > - [`examples/windows-language-guide`](examples/windows-language-guide) — plain captured steps (change the Windows display language).
