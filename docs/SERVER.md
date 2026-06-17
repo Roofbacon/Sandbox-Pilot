@@ -38,6 +38,8 @@ Or use the repo-root helper, which also prints your MCP client config: `..\setup
 | `sandbox_analyze_installers` | Analyze an installer folder or extracted vendor bundle; returns entry points, MSI metadata, script evidence, recommended commands, and notes. |
 | `sandbox_test_install_command` | Run a proposed silent install command with a timeout and optional working directory, then collect exit code, windows, new installed programs, pending reboot state, and log tails. |
 | `sandbox_verify_detection_rule` | Verify MSI product-code, registry, file/version, or PowerShell script detection rules inside the Sandbox, for expected-present or expected-absent states. |
+| `sandbox_assert` | Evaluate one or more pass/fail assertions (file, registry, msiProductCode, script, process, service, window, installedProgram) honoring `expectedPresent`, and return a normalized roll-up. |
+| `sandbox_run_test_plan` | Run an ordered step list (open / run+expectExitCode / assert / capture) and write `junit.xml`, `results.json`, and a screenshot-embedded `summary.md` under `artifacts/testplans/<runId>`; returns the roll-up and host paths. |
 | `sandbox_start_job` / `sandbox_job_status` / `sandbox_job_cancel` | Run long PowerShell operations asynchronously, poll status/log tails, and cancel the process tree if needed. |
 | `sandbox_intune_prereqs` | Find or download Microsoft's IntuneWinAppUtil.exe into the shared `tools` folder and report version/source information. |
 | `sandbox_intune_package_win32` | Test install, verify detection, test uninstall, verify detection absence, then run IntuneWinAppUtil.exe to create a `.intunewin` package under shared `artifacts/intune`, with host paths and deployment metadata suggestions. |

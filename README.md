@@ -27,6 +27,7 @@ Sandbox Pilot exposes [Windows Sandbox](https://learn.microsoft.com/en-us/window
 | **Synchronize** | `sandbox_wait_for` — block until a UI element appears/disappears (no guessed sleeps) |
 | **Bridge files** | `sandbox_bridge_info`, `sandbox_stage_host_path` - discover the active host/guest bridge and copy host files or folders into `C:\SandboxBridge\processed` |
 | **Installers** | `sandbox_find_install_candidates`, `sandbox_msi_inspect`, `sandbox_analyze_installers`, `sandbox_test_install_command`, `sandbox_verify_detection_rule` - inspect installer payloads, infer silent commands, verify installs, and prove detection rules in the disposable VM |
+| **Test** | `sandbox_assert` (file/registry/process/service/window/installedProgram/msiProductCode/script pass-fail checks), `sandbox_run_test_plan` - run a declarative step list and emit JUnit XML + a screenshot-embedded Markdown report |
 | **Intune packaging** | `sandbox_intune_prereqs`, `sandbox_intune_package_win32`, `sandbox_intune_package_from_host` - test install, verify detection, test uninstall, auto-install Microsoft's Win32 Content Prep Tool if needed, and save `.intunewin` packages to shared artifacts |
 | **Long jobs** | `sandbox_start_job`, `sandbox_job_status`, `sandbox_job_cancel` - run long PowerShell operations without blocking the MCP call, with persisted stdout/stderr artifacts |
 | **Document** | `sandbox_annotate` (boxes/arrows/labels/spotlight), `sandbox_guide_step` + `sandbox_guide_build` + `sandbox_guide_reset` |
@@ -150,6 +151,26 @@ When you have a candidate silent command, run it through `sandbox_test_install_c
 Use `sandbox_verify_detection_rule` to prove the detection rule separately from the installer command. It supports MSI product code, registry, file/version, and PowerShell script rules, and can check either expected-present or expected-absent state.
 
 For operations that may outlive a normal MCP tool call, use `sandbox_start_job` and poll with `sandbox_job_status`. Jobs persist stdout/stderr under `C:\SandboxBridge\artifacts\jobs`, and `sandbox_job_cancel` kills the running process tree if needed.
+
+## Testing workflow
+
+`sandbox_assert` evaluates one or more pass/fail checks about the Sandbox state and returns a normalized roll-up. Each assertion has a `type` (`file`, `registry`, `msiProductCode`, `script`, `process`, `service`, `window`, `installedProgram`) and an `expectedPresent` flag, so you can prove both presence (after install) and absence (after uninstall) with the same primitive.
+
+`sandbox_run_test_plan` runs an ordered list of steps and produces a report. Each step may launch something (`open`), run a command whose exit code is checked (`run` / `expectExitCode`), assert state (`assert`), and capture a screenshot (`capture`). A failing step skips the rest by default (`continueOnFailure` to override). The runner writes `junit.xml` (drops straight into CI), `results.json`, and a screenshot-embedded `summary.md` under `bridge\artifacts\testplans\<runId>`, and returns the roll-up plus host paths. The same plan doubles as a regression test and as a generated walkthrough.
+
+```jsonc
+{
+  "name": "Acme silent install",
+  "steps": [
+    { "name": "Silent install", "run": "msiexec /i C:\\SandboxBridge\\processed\\Acme\\acme.msi /qn /norestart",
+      "assert": [{ "type": "installedProgram", "name": "Acme", "minVersion": "1.2.0", "label": "Acme installed" }],
+      "capture": { "caption": "Installed and detected" } },
+    { "name": "Service is running", "assert": [{ "type": "service", "name": "AcmeSvc", "status": "Running" }] },
+    { "name": "Silent uninstall", "run": "msiexec /x {GUID} /qn", "expectExitCode": 0,
+      "assert": [{ "type": "installedProgram", "name": "Acme", "expectedPresent": false, "label": "no residue" }] }
+  ]
+}
+```
 
 ## Intune packaging workflow
 

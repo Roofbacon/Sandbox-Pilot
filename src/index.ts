@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { annotate, bridgeInfo, runBridgeAction, stageHostPath, toBridgeHostPath, bridgeRoot } from "./bridge.js";
 import * as fileBridge from "./bridge.js";
 import * as socketBridge from "./socket-bridge.js";
+import { runTestPlan } from "./testplan.js";
 
 // Transport: "socket" (low latency, guest listens / host connects out) or the default
 // file bridge (shared folder; simpler but ~20s host->guest propagation).
@@ -450,6 +451,87 @@ server.registerTool(
     },
   },
   async (args) => text((await sendCommand("detection_verify", args, Math.max(args.timeoutMs ?? 30000, 1000) + 5000)).data),
+);
+
+const assertionSchema = z
+  .object({
+    type: z
+      .enum(["file", "registry", "msiProductCode", "script", "process", "service", "window", "installedProgram"])
+      .describe("Assertion kind."),
+    label: z.string().optional().describe("Human-readable name shown in reports; defaults to the type."),
+    expectedPresent: z.boolean().default(true).describe("true expects a match; false expects the opposite (e.g. proving uninstall residue is gone)."),
+  })
+  .passthrough()
+  .describe(
+    "One assertion. Type-specific fields (passthrough): " +
+      "file {path, version?|minVersion?}; registry {path, valueName?, operator?(exists|equals|contains|notEquals), value?}; " +
+      "msiProductCode {productCode, productVersion?}; script {script|command, } (exit 0 = detected); " +
+      "process {name}; service {name, status?(Running|Stopped)}; window {title, match?(contains|exact)}; " +
+      "installedProgram {name (contains), minVersion?}.",
+  );
+
+server.registerTool(
+  "sandbox_assert",
+  {
+    title: "Assert sandbox state (pass/fail)",
+    description:
+      "Evaluate one or more assertions about the Sandbox state and return a normalized pass/fail roll-up. " +
+      "Building block for verification and for sandbox_run_test_plan. Each assertion's 'passed' honors " +
+      "expectedPresent, so you can assert both presence (after install) and absence (after uninstall). " +
+      "Supports file/registry/msiProductCode/script (same engine as detection rules) plus process, service, " +
+      "window, and installedProgram checks.",
+    inputSchema: {
+      assertions: z.array(assertionSchema).min(1).describe("Assertions to evaluate."),
+      timeoutMs: z.number().int().positive().default(30000).describe("Timeout for script assertions."),
+    },
+  },
+  async (args) => text((await sendCommand("assert", args, Math.max(args.timeoutMs ?? 30000, 1000) + 5000)).data),
+);
+
+const testStepSchema = z.object({
+  name: z.string().describe("Step name shown in the report (becomes a JUnit testcase)."),
+  open: z.string().optional().describe("Launch an app/file/URI before asserting (sandbox_open)."),
+  run: z.string().optional().describe("PowerShell/command line to run; its exit code gates the step (see expectExitCode)."),
+  runTimeoutMs: z.number().int().positive().optional().describe("Timeout for 'run' (default 120000)."),
+  expectExitCode: z.number().int().optional().describe("Exit code that counts as success for 'run' (default 0)."),
+  assert: z.array(assertionSchema).optional().describe("Assertions evaluated after the action; any failure fails the step."),
+  assertTimeoutMs: z.number().int().positive().optional().describe("Timeout for script assertions (default 30000)."),
+  capture: z
+    .object({
+      caption: z.string().optional(),
+      window: z.boolean().optional().describe("Capture only the foreground window."),
+      region: z.array(z.number()).length(4).optional().describe("[x,y,w,h] real-screen crop."),
+    })
+    .optional()
+    .describe("Capture a screenshot for the doc-mode summary.md."),
+  continueOnFailure: z.boolean().optional().describe("Keep running later steps even if this one fails (default false: remaining steps are skipped)."),
+});
+
+server.registerTool(
+  "sandbox_run_test_plan",
+  {
+    title: "Run a declarative test plan",
+    description:
+      "Run an ordered list of steps in the Sandbox and produce a pass/fail report. Each step can launch " +
+      "something (open), run a command whose exit code is checked (run/expectExitCode), assert state " +
+      "(file/registry/process/service/window/installedProgram/msiProductCode/script), and capture a " +
+      "screenshot. By default a failing step skips the rest (continueOnFailure to override). Writes " +
+      "junit.xml (for CI), results.json, and a screenshot-embedded summary.md under " +
+      "bridge\\artifacts\\testplans\\<runId> and returns the roll-up plus host paths. This is the same " +
+      "definition you can re-run as a regression test or read as documentation.",
+    inputSchema: {
+      name: z.string().describe("Test plan name (used in the report and the run folder)."),
+      steps: z.array(testStepSchema).min(1).describe("Ordered steps."),
+    },
+  },
+  async ({ name, steps }) =>
+    text(
+      await runTestPlan(
+        { sendCommand, screenshot, bridgeRoot, toBridgeHostPath },
+        { name, steps },
+        new Date().toISOString(),
+      ),
+    ),
 );
 
 server.registerTool(

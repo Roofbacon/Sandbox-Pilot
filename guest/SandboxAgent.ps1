@@ -1229,6 +1229,164 @@ function Test-DetectionRule {
     }
 }
 
+function Test-ProcessAssertion {
+    param($Assertion)
+
+    $name = [string](Get-ObjectPropertyValue -Object $Assertion -Name "name" "")
+    if (-not $name) { throw "process assertion requires name." }
+    $bare = $name -replace '\.exe$', ''
+    $procs = @(Get-Process -Name $bare -ErrorAction SilentlyContinue | Select-Object Id, ProcessName)
+    return [ordered]@{
+        detected = ($procs.Count -gt 0)
+        name = $name
+        matchCount = $procs.Count
+        matches = @($procs)
+    }
+}
+
+function Test-ServiceAssertion {
+    param($Assertion)
+
+    $name = [string](Get-ObjectPropertyValue -Object $Assertion -Name "name" "")
+    if (-not $name) { throw "service assertion requires name." }
+    $service = Get-Service -Name $name -ErrorAction SilentlyContinue
+    if (-not $service) {
+        return [ordered]@{ detected = $false; name = $name; exists = $false; status = $null }
+    }
+    $expectedStatus = [string](Get-ObjectPropertyValue -Object $Assertion -Name "status" "")
+    $actualStatus = [string]$service.Status
+    $statusOk = $true
+    if ($expectedStatus) { $statusOk = ($actualStatus -eq $expectedStatus) }
+    return [ordered]@{
+        detected = $statusOk
+        name = $name
+        exists = $true
+        status = $actualStatus
+        expectedStatus = $expectedStatus
+        statusOk = $statusOk
+    }
+}
+
+function Test-WindowAssertion {
+    param($Assertion)
+
+    $title = [string](Get-ObjectPropertyValue -Object $Assertion -Name "title" "")
+    if (-not $title) { $title = [string](Get-ObjectPropertyValue -Object $Assertion -Name "name" "") }
+    if (-not $title) { throw "window assertion requires title." }
+    $match = [string](Get-ObjectPropertyValue -Object $Assertion -Name "match" "contains")
+    $windows = @(Get-TopLevelWindows)
+    $hit = @($windows | Where-Object {
+        if ($match -eq "exact") { [string]$_.name -eq $title }
+        else { ([string]$_.name).IndexOf($title, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 }
+    })
+    return [ordered]@{
+        detected = ($hit.Count -gt 0)
+        title = $title
+        match = $match
+        matchCount = $hit.Count
+        matches = @($hit)
+    }
+}
+
+function Test-InstalledProgramAssertion {
+    param($Assertion)
+
+    $name = [string](Get-ObjectPropertyValue -Object $Assertion -Name "name" "")
+    if (-not $name) { throw "installedProgram assertion requires name." }
+    $minVersion = [string](Get-ObjectPropertyValue -Object $Assertion -Name "minVersion" "")
+    $registryPaths = @(
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+    $found = foreach ($path in $registryPaths) {
+        Get-ItemProperty -Path $path -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -and ([string]$_.DisplayName).IndexOf($name, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 } |
+            Select-Object DisplayName, DisplayVersion, Publisher
+    }
+    $found = @($found)
+    $versionOk = $true
+    if ($minVersion -and $found.Count -gt 0) {
+        $versionOk = $false
+        foreach ($entry in $found) {
+            if (Test-VersionAtLeast -Actual ([string]$entry.DisplayVersion) -Minimum $minVersion) { $versionOk = $true; break }
+        }
+    }
+    return [ordered]@{
+        detected = (($found.Count -gt 0) -and $versionOk)
+        name = $name
+        minVersion = $minVersion
+        matchCount = $found.Count
+        matches = @($found)
+        versionOk = $versionOk
+    }
+}
+
+function Test-Assertion {
+    # Single assertion. Detection-style types (file/registry/msiProductCode/script) reuse the
+    # detection engine; process/service/window/installedProgram are evaluated here. Returns a
+    # normalized record whose 'passed' honors expectedPresent (default true).
+    param(
+        $Assertion,
+        [int]$TimeoutMs = 30000
+    )
+
+    if (-not $Assertion) { throw "assertion is required." }
+    $type = [string](Get-ObjectPropertyValue -Object $Assertion -Name "type" "")
+    if (-not $type) { throw "assertion requires type." }
+    $label = [string](Get-ObjectPropertyValue -Object $Assertion -Name "label" "")
+    $expectedPresent = [bool](Get-ObjectPropertyValue -Object $Assertion -Name "expectedPresent" $true)
+
+    switch ($type) {
+        { @("file", "registry", "msiProductCode", "script") -contains $_ } {
+            $result = Test-DetectionRule -Rule $Assertion -ExpectedPresent $expectedPresent -TimeoutMs $TimeoutMs
+            if (-not $label) { $label = $type }
+            return [ordered]@{
+                type = $type
+                label = $label
+                expectedPresent = $expectedPresent
+                detected = $result.detected
+                passed = $result.passed
+                evidence = $result.evidence
+            }
+        }
+        "process" { $evidence = Test-ProcessAssertion -Assertion $Assertion }
+        "service" { $evidence = Test-ServiceAssertion -Assertion $Assertion }
+        "window" { $evidence = Test-WindowAssertion -Assertion $Assertion }
+        "installedProgram" { $evidence = Test-InstalledProgramAssertion -Assertion $Assertion }
+        default { throw "Unsupported assertion type: $type" }
+    }
+
+    $detected = [bool](Get-ObjectPropertyValue -Object $evidence -Name "detected" $false)
+    if (-not $label) { $label = $type }
+    return [ordered]@{
+        type = $type
+        label = $label
+        expectedPresent = $expectedPresent
+        detected = $detected
+        passed = $(if ($expectedPresent) { $detected } else { -not $detected })
+        evidence = $evidence
+    }
+}
+
+function Invoke-AssertionSet {
+    # Evaluate an array of assertions and roll up pass/fail.
+    param($Assertions, [int]$TimeoutMs = 30000)
+
+    $list = @($Assertions)
+    if ($list.Count -eq 0) { throw "assert requires a non-empty 'assertions' array." }
+    $results = foreach ($assertion in $list) { Test-Assertion -Assertion $assertion -TimeoutMs $TimeoutMs }
+    $results = @($results)
+    $failed = @($results | Where-Object { -not $_.passed })
+    return [ordered]@{
+        passed = ($failed.Count -eq 0)
+        total = $results.Count
+        passedCount = ($results.Count - $failed.Count)
+        failedCount = $failed.Count
+        results = @($results)
+    }
+}
+
 function Test-PackagingDetectionRule {
     param(
         $Rule,
@@ -1923,6 +2081,11 @@ function Invoke-AgentCommand {
             $expectedPresent = [bool](Get-ArgValue $args "expectedPresent" $true)
             $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 30000)
             return @{ data = (Test-DetectionRule -Rule $rule -ExpectedPresent $expectedPresent -TimeoutMs $timeoutMs) }
+        }
+        "assert" {
+            $assertions = Get-ArgValue $args "assertions" $null
+            $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 30000)
+            return @{ data = (Invoke-AssertionSet -Assertions $assertions -TimeoutMs $timeoutMs) }
         }
         "job_start_ps" {
             $command = [string](Get-ArgValue $args "command" "")
