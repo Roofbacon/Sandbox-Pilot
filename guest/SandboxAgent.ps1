@@ -25,6 +25,7 @@ $AgentCommands = @(
     "run_ps", "center_window",
     "installer_candidates", "msi_inspect", "installer_analyze", "installer_test",
     "detection_verify", "assert", "snapshot_capture", "event_logs",
+    "watch_start", "watch_stop", "watch_poll", "watch_wait",
     "job_start_ps", "job_status", "job_cancel",
     "intune_prereqs", "intune_package",
     "processes", "screen_info", "stop_agent"
@@ -601,6 +602,184 @@ function Get-EventLogWindow {
     }
 }
 
+# ---- Real-time screen watcher -------------------------------------------------------------------
+# A background runspace continuously diffs top-level windows, the foreground window, and running
+# process names against the previous snapshot (~every IntervalMs) and appends events to a shared,
+# capped, cursor-indexed buffer. The single-threaded command loop never has to poll the screen
+# itself: it drains the buffer (watch_poll) or blocks until a matching event (watch_wait). This is
+# what lets the agent notice a dialog (e.g. a modal "Windows Installer" box) the moment it appears.
+
+$script:WatchEvents = $null            # [ArrayList]::Synchronized - written by the watcher, read here
+$script:WatchControl = $null           # synchronized hashtable: Running flag, config, MaxId, Error
+$script:WatchRunspace = $null
+$script:WatchPowerShell = $null
+
+$script:WatcherScript = {
+    param($Events, $Control)
+    $ErrorActionPreference = "Stop"
+    # Add the Win32 enumeration helper once per process (runspaces share the AppDomain).
+    if (-not ([System.Management.Automation.PSTypeName]'SbxWinEnum').Type) {
+        Add-Type @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class SbxWinEnum {
+    public delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr h);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    public static List<string> Titles() {
+        var r = new List<string>();
+        EnumWindows((h, l) => {
+            if (IsWindowVisible(h)) {
+                int n = GetWindowTextLength(h);
+                if (n > 0) { var sb = new StringBuilder(n + 1); GetWindowText(h, sb, n + 1); var t = sb.ToString(); if (t.Trim().Length > 0) r.Add(t); }
+            }
+            return true;
+        }, IntPtr.Zero);
+        return r;
+    }
+    public static string Foreground() {
+        var h = GetForegroundWindow();
+        int n = GetWindowTextLength(h); var sb = new StringBuilder(n + 1); GetWindowText(h, sb, n + 1); return sb.ToString();
+    }
+}
+"@
+    }
+
+    $script:nextId = 1
+    $cap = 2000
+    $emit = {
+        param($type, $value)
+        $ev = [pscustomobject]@{ id = $script:nextId; type = $type; value = $value; at = (Get-Date).ToString("o") }
+        [void]$Events.Add($ev)
+        $Control['MaxId'] = $script:nextId
+        $script:nextId++
+        while ($Events.Count -gt $cap) { try { $Events.RemoveAt(0) } catch { break } }
+    }
+
+    $prevTitles = @{}; $prevFg = $null; $prevProcs = @{}; $seeded = $false
+    while ($Control['Running']) {
+        try {
+            $cur = @{}; foreach ($t in [SbxWinEnum]::Titles()) { $cur[$t] = $true }
+            if ($seeded) {
+                foreach ($t in $cur.Keys) { if (-not $prevTitles.ContainsKey($t)) { & $emit "windowOpened" $t } }
+                foreach ($t in $prevTitles.Keys) { if (-not $cur.ContainsKey($t)) { & $emit "windowClosed" $t } }
+            }
+            $prevTitles = $cur
+
+            if ($Control['WatchForeground']) {
+                $fg = [SbxWinEnum]::Foreground()
+                if ($seeded -and $fg -and $fg -ne $prevFg) { & $emit "foregroundChanged" $fg }
+                $prevFg = $fg
+            }
+            if ($Control['WatchProcesses']) {
+                $names = @{}; foreach ($p in (Get-Process -ErrorAction SilentlyContinue)) { $names[$p.ProcessName] = $true }
+                if ($seeded) {
+                    foreach ($n in $names.Keys) { if (-not $prevProcs.ContainsKey($n)) { & $emit "processStarted" $n } }
+                    foreach ($n in $prevProcs.Keys) { if (-not $names.ContainsKey($n)) { & $emit "processExited" $n } }
+                }
+                $prevProcs = $names
+            }
+            $seeded = $true
+        }
+        catch { $Control['Error'] = $_.Exception.Message }
+        Start-Sleep -Milliseconds ([int]$Control['IntervalMs'])
+    }
+}
+
+function Get-WatcherStatus {
+    $running = $false
+    if ($script:WatchControl) { $running = [bool]$script:WatchControl['Running'] }
+    $count = 0; $maxId = 0; $err = $null; $interval = 0
+    if ($script:WatchEvents) { $count = $script:WatchEvents.Count }
+    if ($script:WatchControl) { $maxId = [int]$script:WatchControl['MaxId']; $err = $script:WatchControl['Error']; $interval = [int]$script:WatchControl['IntervalMs'] }
+    return [ordered]@{ running = $running; eventCount = $count; cursor = $maxId; intervalMs = $interval; error = $err }
+}
+
+function Start-SandboxWatcher {
+    param([int]$IntervalMs = 300, [bool]$WatchProcesses = $true, [bool]$WatchForeground = $true)
+
+    if ($script:WatchControl -and $script:WatchControl['Running']) {
+        $status = Get-WatcherStatus
+        $status['alreadyRunning'] = $true
+        return $status
+    }
+    $script:WatchEvents = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+    $script:WatchControl = [hashtable]::Synchronized(@{
+            Running = $true; IntervalMs = $IntervalMs; WatchProcesses = $WatchProcesses
+            WatchForeground = $WatchForeground; MaxId = 0; Error = $null; StartedAt = (Get-Date).ToString("o")
+        })
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.ApartmentState = "MTA"
+    $rs.Open()
+    $ps = [powershell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript($script:WatcherScript).AddArgument($script:WatchEvents).AddArgument($script:WatchControl)
+    [void]$ps.BeginInvoke()
+    $script:WatchRunspace = $rs
+    $script:WatchPowerShell = $ps
+    return (Get-WatcherStatus)
+}
+
+function Confirm-SandboxWatcher {
+    # Start the watcher if it isn't running, giving it one interval to seed its baseline so the
+    # immediately-following operation's events are captured. Returns $true if it had to start it.
+    if ($script:WatchControl -and $script:WatchControl['Running']) { return $false }
+    $status = Start-SandboxWatcher
+    Start-Sleep -Milliseconds 700
+    return $true
+}
+
+function Stop-SandboxWatcher {
+    if (-not ($script:WatchControl)) { return [ordered]@{ stopped = $false; reason = "Watcher was not running." } }
+    $script:WatchControl['Running'] = $false
+    Start-Sleep -Milliseconds 150
+    try { if ($script:WatchPowerShell) { $script:WatchPowerShell.Stop(); $script:WatchPowerShell.Dispose() } } catch { }
+    try { if ($script:WatchRunspace) { $script:WatchRunspace.Close(); $script:WatchRunspace.Dispose() } } catch { }
+    $final = Get-WatcherStatus
+    $script:WatchRunspace = $null; $script:WatchPowerShell = $null
+    return [ordered]@{ stopped = $true; status = $final }
+}
+
+function Get-WatcherEventsSince {
+    param([int]$SinceId = -1, [int]$Max = 500)
+    if (-not $script:WatchEvents) { return [ordered]@{ running = $false; events = @(); cursor = 0; eventCount = 0 } }
+    $all = @($script:WatchEvents.ToArray())
+    $new = @($all | Where-Object { [int]$_.id -gt $SinceId })
+    if ($new.Count -gt $Max) { $new = @($new[($new.Count - $Max)..($new.Count - 1)]) }
+    $cursor = if ($all.Count) { [int]($all[$all.Count - 1].id) } else { [int]$script:WatchControl['MaxId'] }
+    return [ordered]@{
+        running = [bool]$script:WatchControl['Running']
+        events = @($new)
+        cursor = $cursor
+        eventCount = $all.Count
+    }
+}
+
+function Wait-SandboxWatcherEvent {
+    param([int]$TimeoutMs = 15000, [int]$PollMs = 200, [string]$Type = "", [string]$Contains = "", [int]$SinceId = -1)
+
+    [void](Confirm-SandboxWatcher)
+    if ($SinceId -lt 0) { $SinceId = [int]$script:WatchControl['MaxId'] }   # baseline: only future events count
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ($true) {
+        $all = @($script:WatchEvents.ToArray())
+        $new = @($all | Where-Object { [int]$_.id -gt $SinceId })
+        $match = $new | Where-Object {
+            ((-not $Type) -or ($_.type -eq $Type)) -and
+            ((-not $Contains) -or (([string]$_.value).IndexOf($Contains, [System.StringComparison]::OrdinalIgnoreCase) -ge 0))
+        } | Select-Object -First 1
+        $cursor = if ($all.Count) { [int]($all[$all.Count - 1].id) } else { $SinceId }
+        if ($match) { return [ordered]@{ satisfied = $true; timedOut = $false; matched = $match; events = @($new); cursor = $cursor } }
+        if ((Get-Date) -ge $deadline) { return [ordered]@{ satisfied = $false; timedOut = $true; matched = $null; events = @($new); cursor = $cursor } }
+        Start-Sleep -Milliseconds $PollMs
+    }
+}
+
 function Invoke-InstallerCommandTest {
     param(
         [string]$Command,
@@ -610,10 +789,14 @@ function Invoke-InstallerCommandTest {
         [string]$WorkingDirectory = "",
         [bool]$CollectEventLogs = $false,
         [int]$EventLogBufferSeconds = 5,
-        [int]$EventLogMaxEvents = 200
+        [int]$EventLogMaxEvents = 200,
+        [bool]$WatchWindows = $true
     )
 
     if (-not $Command) { throw "Command is required." }
+    # Make sure the screen watcher is live before the command runs, so any window the command pops
+    # (e.g. a modal installer/error dialog the silent switches did not suppress) is captured.
+    if ($WatchWindows) { [void](Confirm-SandboxWatcher) }
     $started = Get-Date
     $beforePrograms = @(Get-InstalledPrograms)
     $wrappedCommand = '$ProgressPreference = "SilentlyContinue"; & { ' + $Command + ' }; if ($null -ne $global:LASTEXITCODE) { exit $global:LASTEXITCODE }'
@@ -686,6 +869,16 @@ function Invoke-InstallerCommandTest {
         $eventLogs = Get-EventLogWindow -StartTime $started.AddSeconds(-$EventLogBufferSeconds) -EndTime (Get-Date) -MaxEvents $EventLogMaxEvents
     }
 
+    # Windows that opened while the command ran (catches modal dialogs that briefly appeared even
+    # if they were dismissed/closed before the command returned).
+    $windowsDuringRun = @()
+    if ($WatchWindows -and $script:WatchEvents) {
+        $startIso = $started.ToString("o")
+        $windowsDuringRun = @($script:WatchEvents.ToArray() |
+                Where-Object { $_.type -eq "windowOpened" -and ([string]$_.at) -ge $startIso } |
+                Select-Object -ExpandProperty value -Unique)
+    }
+
     return [ordered]@{
         command = $Command
         startedAt = $started.ToString("o")
@@ -699,6 +892,7 @@ function Invoke-InstallerCommandTest {
         stderr = $stderr
         newPrograms = @($newPrograms)
         visibleWindows = @(Get-TopLevelWindows)
+        windowsDuringRun = @($windowsDuringRun)
         pendingReboot = $pendingReboot
         logs = @($logs)
         eventLogs = $eventLogs
@@ -2367,6 +2561,28 @@ function Invoke-AgentCommand {
             $assertions = Get-ArgValue $args "assertions" $null
             $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 30000)
             return @{ data = (Invoke-AssertionSet -Assertions $assertions -TimeoutMs $timeoutMs) }
+        }
+        "watch_start" {
+            $intervalMs = [int](Get-ArgValue $args "intervalMs" 300)
+            $watchProcesses = [bool](Get-ArgValue $args "watchProcesses" $true)
+            $watchForeground = [bool](Get-ArgValue $args "watchForeground" $true)
+            return @{ data = (Start-SandboxWatcher -IntervalMs $intervalMs -WatchProcesses $watchProcesses -WatchForeground $watchForeground) }
+        }
+        "watch_stop" {
+            return @{ data = (Stop-SandboxWatcher) }
+        }
+        "watch_poll" {
+            $sinceId = [int](Get-ArgValue $args "sinceId" -1)
+            $max = [int](Get-ArgValue $args "max" 500)
+            return @{ data = (Get-WatcherEventsSince -SinceId $sinceId -Max $max) }
+        }
+        "watch_wait" {
+            $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 15000)
+            $pollMs = [int](Get-ArgValue $args "pollMs" 200)
+            $type = [string](Get-ArgValue $args "type" "")
+            $contains = [string](Get-ArgValue $args "contains" "")
+            $sinceId = [int](Get-ArgValue $args "sinceId" -1)
+            return @{ data = (Wait-SandboxWatcherEvent -TimeoutMs $timeoutMs -PollMs $pollMs -Type $type -Contains $contains -SinceId $sinceId) }
         }
         "snapshot_capture" {
             $label = [string](Get-ArgValue $args "label" "")

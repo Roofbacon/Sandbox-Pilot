@@ -576,6 +576,90 @@ server.registerTool(
   async (args) => text((await sendCommand("event_logs", args, 60000)).data),
 );
 
+// Cursor into the guest's watcher event buffer, so sandbox_watch_poll returns only what's new and
+// sandbox_wait_for_event baselines to "now". Reset whenever the watcher (re)starts.
+let lastWatchCursor = -1;
+
+server.registerTool(
+  "sandbox_watch_start",
+  {
+    title: "Start the real-time screen watcher",
+    description:
+      "Start a background watcher inside the Sandbox that continuously (every intervalMs) notices " +
+      "top-level windows opening/closing, the foreground window changing, and processes starting/" +
+      "exiting — without the agent having to take screenshots. Drain events with sandbox_watch_poll " +
+      "or block on one with sandbox_wait_for_event. This is how you catch a dialog (e.g. a modal " +
+      "installer box) the moment it appears. sandbox_test_install_command auto-starts it.",
+    inputSchema: {
+      intervalMs: z.number().int().positive().default(300).describe("Snapshot/diff cadence in ms (lower = snappier, more CPU)."),
+      watchProcesses: z.boolean().default(true).describe("Emit processStarted/processExited events (by process name)."),
+      watchForeground: z.boolean().default(true).describe("Emit foregroundChanged events."),
+    },
+  },
+  async (args) => {
+    const r = (await sendCommand("watch_start", args, 15000)).data;
+    lastWatchCursor = typeof r?.cursor === "number" ? r.cursor : -1;
+    return text(r);
+  },
+);
+
+server.registerTool(
+  "sandbox_watch_stop",
+  {
+    title: "Stop the screen watcher",
+    description: "Stop the background watcher and tear down its runspace. Returns its final status.",
+    inputSchema: {},
+  },
+  async () => text((await sendCommand("watch_stop", {}, 15000)).data),
+);
+
+server.registerTool(
+  "sandbox_watch_poll",
+  {
+    title: "Drain new watcher events",
+    description:
+      "Return the watcher events that occurred since the last poll (windowOpened / windowClosed / " +
+      "foregroundChanged / processStarted / processExited, each with a timestamp). Cheap — no " +
+      "screenshot. Auto-starts the watcher if it isn't running (then events accrue from that point). " +
+      "Use between actions to learn what changed; use sandbox_wait_for_event to block for one.",
+    inputSchema: {
+      max: z.number().int().positive().default(500).describe("Max events to return."),
+    },
+  },
+  async ({ max }) => {
+    const r = (await sendCommand("watch_poll", { sinceId: lastWatchCursor, max }, 15000)).data;
+    if (typeof r?.cursor === "number") lastWatchCursor = r.cursor;
+    return text(r);
+  },
+);
+
+server.registerTool(
+  "sandbox_wait_for_event",
+  {
+    title: "Block until something happens on screen",
+    description:
+      "Block until the watcher reports a NEW event (from the moment of this call) matching the filter, " +
+      "or until timeout — then return it along with everything else seen meanwhile. The event-driven " +
+      "way to synchronize: instead of guessing sleeps and re-screenshotting, wait for e.g. a window " +
+      "whose title contains 'Installer', or any foreground change. Filter by type and/or a substring " +
+      "of the event value. satisfied=false means it timed out.",
+    inputSchema: {
+      timeoutMs: z.number().int().positive().default(15000).describe("Max time to block, in ms."),
+      pollMs: z.number().int().positive().default(200).describe("Internal poll cadence in ms."),
+      type: z
+        .enum(["windowOpened", "windowClosed", "foregroundChanged", "processStarted", "processExited"])
+        .optional()
+        .describe("Only match this event type (omit to match any)."),
+      contains: z.string().optional().describe("Only match when the event value contains this substring (case-insensitive), e.g. a window title."),
+    },
+  },
+  async (args) => {
+    const r = (await sendCommand("watch_wait", { ...args, sinceId: -1 }, (args.timeoutMs ?? 15000) + 5000)).data;
+    if (typeof r?.cursor === "number") lastWatchCursor = r.cursor;
+    return text(r);
+  },
+);
+
 server.registerTool(
   "sandbox_verify_detection_rule",
   {
