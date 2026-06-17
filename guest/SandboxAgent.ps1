@@ -203,6 +203,384 @@ function Get-InstalledPrograms {
             @{Name="uninstallString";Expression={$_.UninstallString}}
 }
 
+function Get-DefaultDownloadsPath {
+    $path = Join-Path $env:USERPROFILE "Downloads"
+    if (Test-Path -LiteralPath $path) { return $path }
+    return "C:\Users\Public\Downloads"
+}
+
+function ConvertTo-InstallerCommandLiteral {
+    param([string]$Value)
+    return '"' + ($Value -replace '"', '\"') + '"'
+}
+
+function Get-FileStringSample {
+    param([string]$Path, [int]$MaxBytes = 8388608)
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $count = [int][Math]::Min($stream.Length, $MaxBytes)
+        $buffer = New-Object byte[] $count
+        [void]$stream.Read($buffer, 0, $count)
+        return [System.Text.Encoding]::ASCII.GetString($buffer)
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Get-InstallerTechnology {
+    param([System.IO.FileInfo]$File)
+
+    $extension = $File.Extension.ToLowerInvariant()
+    if ($extension -eq ".msi") { return @{ type = "msi"; confidence = "high"; evidence = @("File extension is .msi.") } }
+    if ($extension -eq ".msix") { return @{ type = "msix"; confidence = "high"; evidence = @("File extension is .msix.") } }
+    if ($extension -eq ".appx") { return @{ type = "appx"; confidence = "high"; evidence = @("File extension is .appx.") } }
+    if ($extension -eq ".zip") { return @{ type = "archive"; confidence = "medium"; evidence = @("File extension is .zip.") } }
+
+    $evidence = New-Object System.Collections.ArrayList
+    $type = "exe"
+    $confidence = "low"
+    if ($extension -eq ".exe") {
+        $version = $File.VersionInfo
+        $versionText = @($version.FileDescription, $version.ProductName, $version.CompanyName, $version.OriginalFilename) -join " "
+        if ($versionText -match "InstallShield") { $type = "installshield"; $confidence = "medium"; [void]$evidence.Add("Version info mentions InstallShield.") }
+        elseif ($versionText -match "Advanced Installer") { $type = "advanced_installer"; $confidence = "medium"; [void]$evidence.Add("Version info mentions Advanced Installer.") }
+        elseif ($versionText -match "Squirrel") { $type = "squirrel"; $confidence = "medium"; [void]$evidence.Add("Version info mentions Squirrel.") }
+        elseif ($versionText -match "Setup|Installer") { [void]$evidence.Add("Version info looks like a setup/installer executable.") }
+
+        try {
+            $sample = Get-FileStringSample -Path $File.FullName
+            if ($sample -match "Inno Setup") { $type = "inno_setup"; $confidence = "high"; [void]$evidence.Add("Binary strings contain 'Inno Setup'.") }
+            elseif ($sample -match "Nullsoft|NSIS") { $type = "nsis"; $confidence = "high"; [void]$evidence.Add("Binary strings contain NSIS markers.") }
+            elseif ($sample -match "Burn|WixBundle|WixStdBA") { $type = "wix_burn"; $confidence = "medium"; [void]$evidence.Add("Binary strings contain WiX Burn markers.") }
+            elseif ($sample -match "InstallShield") { $type = "installshield"; $confidence = "medium"; [void]$evidence.Add("Binary strings contain InstallShield markers.") }
+            elseif ($sample -match "Advanced Installer") { $type = "advanced_installer"; $confidence = "medium"; [void]$evidence.Add("Binary strings contain Advanced Installer markers.") }
+        }
+        catch { [void]$evidence.Add("Could not sample executable strings: $($_.Exception.Message)") }
+
+        $nearbyMsi = @(Get-ChildItem -LiteralPath $File.DirectoryName -Filter *.msi -File -ErrorAction SilentlyContinue)
+        if ($nearbyMsi.Count -gt 0 -and $File.Name -match "^setup\.exe$") {
+            $type = "msi_bundle_wrapper"
+            $confidence = "high"
+            [void]$evidence.Add("Setup.exe sits beside $($nearbyMsi.Count) MSI file(s).")
+        }
+    }
+
+    if ($evidence.Count -eq 0) { [void]$evidence.Add("No installer technology marker found beyond file extension.") }
+    return @{ type = $type; confidence = $confidence; evidence = @($evidence) }
+}
+
+function Get-MsiPropertyMap {
+    param($Database)
+
+    $properties = @{}
+    $view = $null
+    try {
+        $view = $Database.OpenView('SELECT `Property`,`Value` FROM `Property`')
+        $view.Execute()
+        while ($record = $view.Fetch()) {
+            $properties[$record.StringData(1)] = $record.StringData(2)
+        }
+    }
+    finally {
+        if ($view) { $view.Close() }
+    }
+    return $properties
+}
+
+function Get-MsiInfo {
+    param([string]$Path)
+
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $database = $null
+    try {
+        $database = $installer.OpenDatabase($Path, 0)
+        $properties = Get-MsiPropertyMap -Database $database
+        $publicProperties = @()
+        foreach ($name in ($properties.Keys | Sort-Object)) {
+            if ($name -cmatch '^[A-Z0-9_]+$') {
+                $publicProperties += [ordered]@{ name = $name; value = $properties[$name] }
+            }
+        }
+        $notablePattern = "REBOOT|RESTART|LOCK|PRE|DISABLE|PROFILE|CONFIG|TOKEN|ACCOUNT|SERVER|CERT|VPN|NAM|NVM|DART|POSTURE|UMBRELLA|ZTA|THOUSAND|SBL"
+        $notable = @($publicProperties | Where-Object { $_.name -match $notablePattern })
+        $file = Get-Item -LiteralPath $Path
+        $base = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+        return [ordered]@{
+            path = $file.FullName
+            file = $file.Name
+            productName = $properties["ProductName"]
+            productVersion = $properties["ProductVersion"]
+            productCode = $properties["ProductCode"]
+            upgradeCode = $properties["UpgradeCode"]
+            manufacturer = $properties["Manufacturer"]
+            allUsers = $properties["ALLUSERS"]
+            reboot = $properties["REBOOT"]
+            publicProperties = @($publicProperties)
+            notableProperties = @($notable)
+            suggestedSilentCommand = "msiexec /i " + (ConvertTo-InstallerCommandLiteral $file.FullName) + " /qn /norestart /L*v " + (ConvertTo-InstallerCommandLiteral ('$env:TEMP\' + $base + "-install.log"))
+        }
+    }
+    finally {
+        if ($database) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($database) }
+        if ($installer) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($installer) }
+    }
+}
+
+function Get-InstallerCandidates {
+    param([string]$Path = "", [bool]$Recurse = $true)
+
+    if (-not $Path) { $Path = Get-DefaultDownloadsPath }
+    if (-not (Test-Path -LiteralPath $Path)) { throw "Path does not exist: $Path" }
+
+    $files = if ($Recurse) {
+        Get-ChildItem -LiteralPath $Path -File -Recurse -ErrorAction SilentlyContinue
+    }
+    else {
+        Get-ChildItem -LiteralPath $Path -File -ErrorAction SilentlyContinue
+    }
+    $installerExts = @(".msi", ".exe", ".msix", ".appx", ".zip")
+    $candidates = foreach ($file in $files) {
+        $extension = $file.Extension.ToLowerInvariant()
+        if ($installerExts -notcontains $extension) { continue }
+
+        $tech = Get-InstallerTechnology -File $file
+        $score = 10
+        $reasons = New-Object System.Collections.ArrayList
+        [void]$reasons.Add("Extension $extension is installable or inspectable.")
+        if ($extension -eq ".msi") { $score += 60; [void]$reasons.Add("MSI supports msiexec silent switches.") }
+        if ($file.Name -match "setup|install|predeploy|bootstrap") { $score += 15; [void]$reasons.Add("Filename looks like an installer entry point.") }
+        if ($tech.type -eq "msi_bundle_wrapper") { $score += 25; [void]$reasons.Add("Wrapper sits beside MSI payloads.") }
+        if ($tech.confidence -eq "high") { $score += 10 }
+
+        [ordered]@{
+            path = $file.FullName
+            file = $file.Name
+            directory = $file.DirectoryName
+            extension = $extension
+            size = $file.Length
+            lastWriteTime = $file.LastWriteTime.ToString("o")
+            technology = $tech.type
+            technologyConfidence = $tech.confidence
+            evidence = @($tech.evidence)
+            score = $score
+            reasons = @($reasons)
+        }
+    }
+
+    return @($candidates | Sort-Object score, file -Descending)
+}
+
+function Get-InstallerScriptEvidence {
+    param([string]$Path, [bool]$Recurse = $true)
+
+    $files = if ($Recurse) {
+        Get-ChildItem -LiteralPath $Path -File -Recurse -ErrorAction SilentlyContinue
+    }
+    else {
+        Get-ChildItem -LiteralPath $Path -File -ErrorAction SilentlyContinue
+    }
+    $scriptExts = @(".hta", ".cmd", ".bat", ".ps1", ".txt", ".ini")
+    $files = @($files | Where-Object { $scriptExts -contains $_.Extension.ToLowerInvariant() })
+    $pattern = "msiexec|/qn|/quiet|/passive|/silent|/verysilent|/norestart|REBOOT=|LOCKDOWN|PRE_DEPLOY|DISABLE|InstallShield|Inno|NSIS"
+    $evidence = foreach ($file in $files) {
+        try {
+            Select-String -LiteralPath $file.FullName -Pattern $pattern -CaseSensitive:$false -ErrorAction Stop |
+                Select-Object -First 80 |
+                ForEach-Object {
+                    [ordered]@{ path = $_.Path; lineNumber = $_.LineNumber; line = ($_.Line.Trim()) }
+                }
+        }
+        catch { }
+    }
+    return @($evidence)
+}
+
+function Get-InstallerFolderAnalysis {
+    param([string]$Path = "", [bool]$Recurse = $true)
+
+    if (-not $Path) { $Path = Get-DefaultDownloadsPath }
+    if (-not (Test-Path -LiteralPath $Path)) { throw "Path does not exist: $Path" }
+    $resolved = (Resolve-Path -LiteralPath $Path).Path
+    $candidates = @(Get-InstallerCandidates -Path $resolved -Recurse $Recurse)
+    $msiCandidates = @($candidates | Where-Object { $_.extension -eq ".msi" })
+    $msis = foreach ($candidate in $msiCandidates) {
+        try { Get-MsiInfo -Path $candidate.path }
+        catch { [ordered]@{ path = $candidate.path; error = $_.Exception.Message } }
+    }
+    $evidence = @(Get-InstallerScriptEvidence -Path $resolved -Recurse $Recurse)
+    $entrypoints = @($candidates | Sort-Object score -Descending | Select-Object -First 12)
+
+    $kind = "unknown"
+    $confidence = "low"
+    $notes = New-Object System.Collections.ArrayList
+    if ($msis.Count -gt 1) {
+        $kind = "msi_bundle"
+        $confidence = "high"
+        [void]$notes.Add("Multiple MSI payloads found; install selected modules with msiexec.")
+    }
+    elseif ($msis.Count -eq 1) {
+        $kind = "msi"
+        $confidence = "high"
+        [void]$notes.Add("Single MSI payload found; use msiexec /i with /qn.")
+    }
+    elseif ($entrypoints.Count -gt 0) {
+        $kind = $entrypoints[0].technology
+        $confidence = $entrypoints[0].technologyConfidence
+    }
+    if (@($evidence | Where-Object { $_.line -match "PRE_DEPLOY_DISABLE_VPN" }).Count -gt 0) {
+        [void]$notes.Add("Script evidence references PRE_DEPLOY_DISABLE_VPN; include it when needed for Cisco module-only installs.")
+    }
+    if (@($evidence | Where-Object { $_.line -match "LOCKDOWN" }).Count -gt 0) {
+        [void]$notes.Add("Script evidence references LOCKDOWN; add LOCKDOWN=1 if service lockdown is desired.")
+    }
+    if ($msis.Count -gt 0) {
+        [void]$notes.Add("Use /L*v with each MSI so failures can be diagnosed from verbose logs.")
+    }
+
+    $recommendedCommands = foreach ($msi in $msis) {
+        if ($msi.suggestedSilentCommand) {
+            [ordered]@{
+                file = $msi.file
+                productName = $msi.productName
+                command = $msi.suggestedSilentCommand
+                confidence = "high"
+            }
+        }
+    }
+
+    return [ordered]@{
+        path = $resolved
+        kind = $kind
+        confidence = $confidence
+        entrypoints = @($entrypoints)
+        msiPackages = @($msis)
+        scriptEvidence = @($evidence)
+        recommendedCommands = @($recommendedCommands)
+        notes = @($notes)
+    }
+}
+
+function Get-TopLevelWindows {
+    $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+    $windows = New-Object System.Collections.ArrayList
+    try {
+        $w = $walker.GetFirstChild([System.Windows.Automation.AutomationElement]::RootElement)
+        while ($w -and $windows.Count -lt 80) {
+            try {
+                $info = $w.Current
+                $ct = ($info.ControlType.ProgrammaticName -replace '^ControlType\.', '')
+                if ($ct -eq "Window" -and $info.Name) {
+                    [void]$windows.Add([ordered]@{ name = [string]$info.Name; automationId = [string]$info.AutomationId })
+                }
+            }
+            catch { }
+            $w = $walker.GetNextSibling($w)
+        }
+    }
+    catch { }
+    return @($windows)
+}
+
+function Get-LogTail {
+    param([string]$Path, [int]$TailLines = 80)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    return [ordered]@{
+        path = (Resolve-Path -LiteralPath $Path).Path
+        tail = @((Get-Content -LiteralPath $Path -Tail $TailLines -ErrorAction SilentlyContinue))
+    }
+}
+
+function Invoke-InstallerCommandTest {
+    param(
+        [string]$Command,
+        [int]$TimeoutMs = 120000,
+        [string]$LogPath = "",
+        [int]$LogTailLines = 80
+    )
+
+    if (-not $Command) { throw "Command is required." }
+    $started = Get-Date
+    $beforePrograms = @(Get-InstalledPrograms)
+    $wrappedCommand = '$ProgressPreference = "SilentlyContinue"; ' + $Command
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($wrappedCommand))
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "powershell.exe"
+    $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded"
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+
+    $process = [System.Diagnostics.Process]::Start($psi)
+    $completed = $process.WaitForExit($TimeoutMs)
+    $timedOut = -not $completed
+    if ($timedOut) {
+        try { & taskkill.exe /PID $process.Id /T /F | Out-Null } catch { try { $process.Kill() } catch { } }
+    }
+    $stdout = ""
+    $stderr = ""
+    try { $stdout = $process.StandardOutput.ReadToEnd() } catch { }
+    try { $stderr = $process.StandardError.ReadToEnd() } catch { }
+    $exitCode = $null
+    if (-not $timedOut) { $exitCode = $process.ExitCode }
+
+    $afterPrograms = @(Get-InstalledPrograms)
+    $beforeKeys = @{}
+    foreach ($p in $beforePrograms) { $beforeKeys["$($p.name)|$($p.version)|$($p.publisher)"] = $true }
+    $newPrograms = @($afterPrograms | Where-Object { -not $beforeKeys.ContainsKey("$($_.name)|$($_.version)|$($_.publisher)") })
+
+    $logs = @()
+    if ($LogPath) {
+        $tail = Get-LogTail -Path $LogPath -TailLines $LogTailLines
+        if ($tail) { $logs += $tail }
+    }
+    $recentLogs = Get-ChildItem -Path $env:TEMP -File -ErrorAction SilentlyContinue |
+        Where-Object { @(".log", ".txt") -contains $_.Extension.ToLowerInvariant() } |
+        Where-Object { $_.LastWriteTime -ge $started } |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 5
+    foreach ($log in $recentLogs) {
+        if ($LogPath -and ((Resolve-Path -LiteralPath $LogPath -ErrorAction SilentlyContinue).Path -eq $log.FullName)) { continue }
+        $tail = Get-LogTail -Path $log.FullName -TailLines ([Math]::Min($LogTailLines, 40))
+        if ($tail) { $logs += $tail }
+    }
+
+    $pendingRebootKeys = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired",
+        "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager"
+    )
+    $pendingReboot = $false
+    foreach ($key in $pendingRebootKeys) {
+        try {
+            if ($key -like "*Session Manager") {
+                $value = (Get-ItemProperty -Path $key -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+                if ($value) { $pendingReboot = $true }
+            }
+            elseif (Test-Path $key) { $pendingReboot = $true }
+        }
+        catch { }
+    }
+
+    return [ordered]@{
+        command = $Command
+        startedAt = $started.ToString("o")
+        finishedAt = (Get-Date).ToString("o")
+        timedOut = $timedOut
+        timeoutMs = $TimeoutMs
+        pid = $process.Id
+        exitCode = $exitCode
+        stdout = $stdout
+        stderr = $stderr
+        newPrograms = @($newPrograms)
+        visibleWindows = @(Get-TopLevelWindows)
+        pendingReboot = $pendingReboot
+        logs = @($logs)
+    }
+}
+
 function Invoke-MouseClick {
     param(
         [int]$X,
@@ -668,6 +1046,28 @@ function Invoke-AgentCommand {
         }
         "inventory" {
             return @{ data = @(Get-InstalledPrograms) }
+        }
+        "installer_candidates" {
+            $path = [string](Get-ArgValue $args "path" "")
+            $recurse = [bool](Get-ArgValue $args "recurse" $true)
+            return @{ data = @(Get-InstallerCandidates -Path $path -Recurse $recurse) }
+        }
+        "msi_inspect" {
+            $path = [string](Get-ArgValue $args "path" "")
+            if (-not $path) { throw "msi_inspect requires 'path'." }
+            return @{ data = (Get-MsiInfo -Path $path) }
+        }
+        "installer_analyze" {
+            $path = [string](Get-ArgValue $args "path" "")
+            $recurse = [bool](Get-ArgValue $args "recurse" $true)
+            return @{ data = (Get-InstallerFolderAnalysis -Path $path -Recurse $recurse) }
+        }
+        "installer_test" {
+            $command = [string](Get-ArgValue $args "command" "")
+            $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 120000)
+            $logPath = [string](Get-ArgValue $args "logPath" "")
+            $logTailLines = [int](Get-ArgValue $args "logTailLines" 80)
+            return @{ data = (Invoke-InstallerCommandTest -Command $command -TimeoutMs $timeoutMs -LogPath $logPath -LogTailLines $logTailLines) }
         }
         "processes" {
             $processes = Get-Process |

@@ -264,6 +264,79 @@ server.registerTool(
 );
 
 server.registerTool(
+  "sandbox_find_install_candidates",
+  {
+    title: "Find installer candidates",
+    description:
+      "Scan the Sandbox Downloads folder (or a supplied path) for likely installer payloads and entry points. " +
+      "Returns ranked .msi/.exe/.msix/.appx/.zip files with detected installer technology and evidence. " +
+      "Use this as the first step when asked to figure out silent install switches for software dropped in Downloads.",
+    inputSchema: {
+      path: z.string().optional().describe("Guest path to scan. Defaults to the current user's Downloads folder."),
+      recurse: z.boolean().default(true).describe("Scan recursively."),
+    },
+  },
+  async ({ path, recurse }) => text((await sendCommand("installer_candidates", { path, recurse }, 60000)).data),
+);
+
+server.registerTool(
+  "sandbox_msi_inspect",
+  {
+    title: "Inspect an MSI",
+    description:
+      "Read MSI metadata directly from Windows Installer tables: ProductName, ProductVersion, ProductCode, " +
+      "UpgradeCode, public properties, notable install/reboot/config properties, and a suggested msiexec /qn command.",
+    inputSchema: {
+      path: z.string().describe("Guest path to an .msi file."),
+    },
+  },
+  async ({ path }) => text((await sendCommand("msi_inspect", { path }, 60000)).data),
+);
+
+server.registerTool(
+  "sandbox_analyze_installers",
+  {
+    title: "Analyze installer folder",
+    description:
+      "Analyze a folder of installer payloads, especially extracted vendor predeploy bundles. " +
+      "Returns entry points, MSI package metadata, script evidence such as msiexec lines/properties, " +
+      "recommended silent commands, and notes about properties like PRE_DEPLOY_DISABLE_VPN or LOCKDOWN.",
+    inputSchema: {
+      path: z.string().optional().describe("Guest folder to analyze. Defaults to the current user's Downloads folder."),
+      recurse: z.boolean().default(true).describe("Scan recursively."),
+    },
+  },
+  async ({ path, recurse }) => text((await sendCommand("installer_analyze", { path, recurse }, 90000)).data),
+);
+
+server.registerTool(
+  "sandbox_test_install_command",
+  {
+    title: "Test a silent installer command",
+    description:
+      "Run a proposed installer command in the Sandbox with a timeout and collect exit code, stdout/stderr, " +
+      "new installed-program registry entries, visible top-level windows, pending-reboot indicators, and log tails. " +
+      "Use this to verify that a candidate switch set is actually silent and successful.",
+    inputSchema: {
+      command: z.string().describe("Full command line to run inside PowerShell in the Sandbox."),
+      timeoutMs: z.number().int().positive().default(120000).describe("Maximum time to wait before killing the process tree."),
+      logPath: z.string().optional().describe("Optional expected installer log path to tail."),
+      logTailLines: z.number().int().positive().default(80).describe("Number of lines to include from the main log."),
+    },
+  },
+  async (args) =>
+    text(
+      (
+        await sendCommand(
+          "installer_test",
+          args,
+          Math.max(args.timeoutMs ?? 120000, 1000) + 30000,
+        )
+      ).data,
+    ),
+);
+
+server.registerTool(
   "sandbox_center_window",
   {
     title: "Center the foreground window",

@@ -25,6 +25,7 @@ Sandbox Pilot exposes [Windows Sandbox](https://learn.microsoft.com/en-us/window
 | **Act (UIA)** | `sandbox_invoke` — actuate a control by name/automationId via Invoke / Toggle / Select / Expand / SetValue (no coordinates, no focus fuss) |
 | **Act (input)** | `sandbox_click`, `sandbox_double_click`, `sandbox_scroll`, `sandbox_drag`, `sandbox_type`, `sandbox_key`, `sandbox_open`, `sandbox_run_ps`, `sandbox_center_window`, `sandbox_set_resolution` |
 | **Synchronize** | `sandbox_wait_for` — block until a UI element appears/disappears (no guessed sleeps) |
+| **Installers** | `sandbox_find_install_candidates`, `sandbox_msi_inspect`, `sandbox_analyze_installers`, `sandbox_test_install_command` - inspect installer payloads, infer silent commands, and verify them in the disposable VM |
 | **Document** | `sandbox_annotate` (boxes/arrows/labels/spotlight), `sandbox_guide_step` + `sandbox_guide_build` + `sandbox_guide_reset` |
 | **Lifecycle** | `sandbox_prepare` (one call to a control-ready Sandbox; `fresh=true` to force a clean boot), `sandbox_stop` (reset — destroy the VM), `sandbox_status` |
 
@@ -134,6 +135,12 @@ cd Sandbox-Pilot
 2. **`sandbox_invoke`** to actuate by element (Invoke/Toggle/Select/SetValue) — no coordinate math, robust to window movement.
 3. **`sandbox_screenshot`** for genuine visual judgment (rendering, images). Use `window`/`region` to keep it sharp and small.
 4. **`sandbox_ocr`** when an app exposes no UI tree (Chromium/CEF dialogs, custom-drawn UIs, games) — returns words with real-pixel click points.
+
+## Installer analysis workflow
+
+For software dropped into the Sandbox, start with `sandbox_find_install_candidates` against Downloads, then use `sandbox_analyze_installers` on the highest-ranked folder or payload directory. MSI packages can be inspected directly with `sandbox_msi_inspect`, which returns product metadata, public properties, notable reboot/config flags, and a ready-to-test `msiexec /i ... /qn /norestart /L*v ...` command.
+
+When you have a candidate silent command, run it through `sandbox_test_install_command`. It executes inside the disposable VM with a timeout and reports the exit code, visible windows, newly registered installed programs, pending-reboot signals, and installer log tails, so an agent can distinguish "switches look plausible" from "this actually installed silently."
 
 ## Transports
 
