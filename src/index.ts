@@ -15,7 +15,7 @@ const sendCommand = TRANSPORT.sendCommand;
 const screenshot = TRANSPORT.screenshot;
 
 const server = new McpServer({
-  name: "windows-sandbox",
+  name: "sandbox-pilot",
   version: "0.1.0",
 });
 
@@ -451,7 +451,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   const mode = process.env.SANDBOX_TRANSPORT === "socket" ? "socket" : "file";
-  console.error(`[windows-sandbox-mcp] connected. transport=${mode} bridgeRoot=${bridgeRoot}`);
+  console.error(`[sandbox-pilot] connected. transport=${mode} bridgeRoot=${bridgeRoot}`);
 }
 
 main().catch((err) => {
