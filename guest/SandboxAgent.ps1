@@ -2,11 +2,33 @@ param(
     # When > 0, run the low-latency socket transport (guest listens, host connects out)
     # instead of the file-polling transport. The shared folder is then used only to
     # publish the guest's connection endpoint.
-    [int]$SocketPort = 0
+    [int]$SocketPort = 0,
+    # Load the functions without creating bridge folders or starting the command loop, so the
+    # agent can be dot-sourced for debugging or unit testing on a host where AV permits it.
+    [switch]$NoStart
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
+
+# Agent version + wire protocol. The protocol is bumped only on a breaking change to the
+# command/result contract; the MCP server compares it during sandbox_health to catch a stale
+# agent (guest/server drift) loudly instead of failing on an unknown command later.
+$AgentVersion = "0.2.0"
+$AgentProtocol = 1
+
+# Command types this agent advertises (see Invoke-AgentCommand). Get-AgentCapabilities returns
+# this; an offline test asserts every entry has a matching dispatcher case, so it cannot drift.
+$AgentCommands = @(
+    "health", "ui_tree", "invoke", "wait_for", "ocr", "screenshot",
+    "click", "double_click", "scroll", "drag", "type", "key", "open",
+    "run_ps", "center_window",
+    "installer_candidates", "msi_inspect", "installer_analyze", "installer_test",
+    "detection_verify", "assert", "snapshot_capture", "event_logs",
+    "job_start_ps", "job_status", "job_cancel",
+    "intune_prereqs", "intune_package",
+    "processes", "screen_info", "stop_agent"
+)
 
 $BridgeRoot = $PSScriptRoot
 $CommandsDir = Join-Path $BridgeRoot "commands"
@@ -21,8 +43,18 @@ $ToolsDir = Join-Path $BridgeRoot "tools"
 $LogsDir = Join-Path $BridgeRoot "logs"
 $LogPath = Join-Path $LogsDir "sandbox-agent.log"
 
-foreach ($dir in @($CommandsDir, $ProcessedDir, $ResultsDir, $ArtifactsDir, $ScreenshotsDir, $IntuneArtifactsDir, $JobsDir, $SnapshotsDir, $ToolsDir, $LogsDir)) {
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+if (-not $NoStart) {
+    foreach ($dir in @($CommandsDir, $ProcessedDir, $ResultsDir, $ArtifactsDir, $ScreenshotsDir, $IntuneArtifactsDir, $JobsDir, $SnapshotsDir, $ToolsDir, $LogsDir)) {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    }
+}
+
+function Get-AgentCapabilities {
+    return [ordered]@{
+        version = $AgentVersion
+        protocol = $AgentProtocol
+        commands = @($AgentCommands)
+    }
 }
 
 function Write-AgentLog {
@@ -2672,6 +2704,9 @@ function Invoke-AgentCommand {
                     screen = @($vs.Width, $vs.Height)
                     headless = ($vs.Width -le 320 -and $vs.Height -le 320)
                     foreground = $fg
+                    version = $AgentVersion
+                    protocol = $AgentProtocol
+                    commands = @($AgentCommands)
                 } }
         }
         "stop_agent" {
@@ -2811,6 +2846,10 @@ function Start-SocketAgent {
     $listener.Stop()
     Write-AgentLog "Socket agent stopped"
 }
+
+# When dot-sourced for tests, stop here: the functions are defined but no folders, log, or
+# command loop are touched.
+if ($NoStart) { return }
 
 Write-AgentLog "Sandbox agent started from $BridgeRoot"
 

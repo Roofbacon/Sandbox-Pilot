@@ -10,6 +10,7 @@ import * as socketBridge from "./socket-bridge.js";
 import { runTestPlan } from "./testplan.js";
 import { diffSnapshots } from "./snapshot.js";
 import { buildGuideDocs } from "./guidedoc.js";
+import { cleanupArtifacts } from "./cleanup.js";
 
 // Transport: "socket" (low latency, guest listens / host connects out) or the default
 // file bridge (shared folder; simpler but ~20s host->guest propagation).
@@ -17,9 +18,14 @@ const TRANSPORT = process.env.SANDBOX_TRANSPORT === "socket" ? socketBridge : fi
 const sendCommand = TRANSPORT.sendCommand;
 const screenshot = TRANSPORT.screenshot;
 
+const SERVER_VERSION = "0.2.0";
+// Bump only on a breaking change to the guest command/result contract. sandbox_health compares
+// this with the value the guest agent reports, so a stale agent surfaces as a clear warning.
+const EXPECTED_GUEST_PROTOCOL = 1;
+
 const server = new McpServer({
   name: "sandbox-pilot",
-  version: "0.1.0",
+  version: SERVER_VERSION,
 });
 
 const text = (value: unknown) => ({
@@ -950,10 +956,53 @@ server.registerTool(
     description:
       "Quick liveness probe: confirms the guest agent responds and reports transport, pid, screen " +
       "size, whether the session is headless (200x200 — capture/OCR won't work until reconnected), " +
-      "and the foreground window name.",
+      "the foreground window name, and a compatibility block comparing the guest agent version/" +
+      "protocol against this server's. A mismatch (warning set) means the agent in the Sandbox is " +
+      "stale — redeploy it with `host\\SandboxBridge.ps1 reload-agent`.",
     inputSchema: {},
   },
-  async () => text((await sendCommand("health", {}, 10000)).data),
+  async () => {
+    const data = (await sendCommand("health", {}, 10000)).data ?? {};
+    const guestProtocol = typeof data.protocol === "number" ? data.protocol : null;
+    const compatible = guestProtocol === EXPECTED_GUEST_PROTOCOL;
+    const compatibility = {
+      serverVersion: SERVER_VERSION,
+      serverProtocol: EXPECTED_GUEST_PROTOCOL,
+      guestVersion: data.version ?? null,
+      guestProtocol,
+      compatible,
+      warning: compatible
+        ? null
+        : guestProtocol === null
+          ? "Guest agent did not report a protocol version — it predates the handshake. Redeploy with reload-agent."
+          : `Guest agent protocol ${guestProtocol} != server ${EXPECTED_GUEST_PROTOCOL}. The agent is stale; redeploy with reload-agent.`,
+    };
+    return text({ ...data, compatibility });
+  },
+);
+
+server.registerTool(
+  "sandbox_cleanup",
+  {
+    title: "Prune old run artifacts",
+    description:
+      "Delete old artifacts the server accumulates in the shared bridge — job logs, test-plan runs, " +
+      "snapshots, snapshot diffs, and screenshots (and optionally recorded guides). Each area keeps " +
+      "the newest `keepLast` entries; beyond that it removes entries older than `maxAgeDays` (or all of " +
+      "them if `maxAgeDays` is omitted). Use `dryRun` to preview. Works even when the Sandbox agent is " +
+      "not running, since the bridge is a host folder.",
+    inputSchema: {
+      maxAgeDays: z.number().positive().optional().describe("Only delete entries older than this many days (omit to delete everything beyond keepLast)."),
+      keepLast: z.number().int().min(0).default(20).describe("Always keep this many newest entries per area."),
+      includeGuides: z.boolean().default(false).describe("Also prune recorded guides under bridge/guides (off by default — guides are deliverables)."),
+      areas: z
+        .array(z.enum(["jobs", "testplans", "snapshots", "snapshotDiffs", "screenshots", "guides"]))
+        .optional()
+        .describe("Restrict cleanup to these areas (default: all except guides)."),
+      dryRun: z.boolean().default(false).describe("Report what would be removed without deleting."),
+    },
+  },
+  async (args) => text(await cleanupArtifacts({ bridgeRoot }, args, Date.now())),
 );
 
 // ---- Annotation ----------------------------------------------------------

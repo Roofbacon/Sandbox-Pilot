@@ -19,8 +19,9 @@ Or use the repo-root helper, which also prints your MCP client config: `..\setup
 
 | Tool | Purpose |
 |---|---|
-| `sandbox_health` | Liveness probe: agent responds, transport, pid, screen size, headless flag, foreground window. |
+| `sandbox_health` | Liveness probe: agent responds, transport, pid, screen size, headless flag, foreground window, plus a `compatibility` block comparing the guest agent's version/protocol with the server's (warns when the agent is stale). |
 | `sandbox_status` | List running Sandboxes (wsb). |
+| `sandbox_cleanup` | Prune old run artifacts in the shared bridge (jobs, test-plan runs, snapshots, snapshot diffs, screenshots; guides opt-in) by `keepLast` and `maxAgeDays`; `dryRun` previews. Works without the agent running. |
 | `sandbox_prepare` | One call: start/reuse a Sandbox, open the interactive session, pin a clean 1920×1080 resolution, set DNS, and start the control agent (socket agent + wait for its endpoint when `SANDBOX_TRANSPORT=socket`). Reuses a running Sandbox by default; pass `fresh=true` to destroy it first and boot clean. |
 | `sandbox_stop` | Destroy the Sandbox VM — a real reset that wipes all guest state (omit `id` to stop all). `wsb` runs the VM detached, so closing the window only closes the viewer; the VM persists until stopped here. |
 | `sandbox_set_resolution` | Resize the guest desktop to a deterministic resolution (default 1920×1080). `sandbox_prepare` applies this automatically; call it if `sandbox_health` reports a tiny/huge screen. |
