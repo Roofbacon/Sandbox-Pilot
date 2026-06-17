@@ -135,6 +135,8 @@ cd Sandbox-Pilot
 3. **`sandbox_screenshot`** for genuine visual judgment (rendering, images). Use `window`/`region` to keep it sharp and small.
 4. **`sandbox_ocr`** when an app exposes no UI tree (Chromium/CEF dialogs, custom-drawn UIs, games) — returns words with real-pixel click points.
 
+For guide annotations, prefer `target`, `toTarget`, and `fromTarget` selectors on `sandbox_guide_step` so boxes and arrows are drawn from the live UIA rectangles. If you measure pixels from a screenshot instead, pass `shapeCoordinates: "image"` (or per-shape `coordinateSpace: "image"`) so window-offset metadata is applied correctly.
+
 ## Transports
 
 Set `SANDBOX_TRANSPORT`:

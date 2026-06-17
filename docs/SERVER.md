@@ -34,13 +34,14 @@ Or use the repo-root helper, which also prints your MCP client config: `..\setup
 | `sandbox_open` | Launch an app / file / URI (incl. `ms-settings:` links). |
 | `sandbox_run_ps` | Run PowerShell in the Sandbox, return its output. |
 | `sandbox_center_window` | Center the foreground window for clean screenshots. |
-| `sandbox_annotate` | Draw boxes/arrows/labels/spotlight on a screenshot (screen or image coords; screen mode is capture-offset aware, so window/region shots annotate correctly). |
-| `sandbox_guide_step` / `sandbox_guide_build` / `sandbox_guide_reset` | Record captioned (optionally annotated) screenshot steps into a named guide, then assemble them into a Markdown document with embedded images. |
+| `sandbox_annotate` | Draw boxes/arrows/labels/spotlight on a screenshot (screen or image coords; screen mode is capture-offset aware, so window/region shots annotate correctly). Individual shapes can set `coordinateSpace: "image"` when most shapes are screen-based. |
+| `sandbox_guide_step` / `sandbox_guide_build` / `sandbox_guide_reset` | Record captioned (optionally annotated) screenshot steps into a named guide, then assemble them into a Markdown document with embedded images. Guide-step annotations can use UIA `target` / `toTarget` / `fromTarget` selectors so boxes/arrows are resolved from the live element rectangle before drawing. |
 
 Sensing guidance baked into the tool descriptions: prefer `sandbox_ui_tree` for "what's on
 screen / where to click" (cheap, exact coordinates); use `sandbox_screenshot` for visual
 judgment. On apps that expose no UI tree (Chromium/CEF dialogs, custom-drawn UIs), fall back
-to a screenshot and use `sandbox_annotate` in `image` mode.
+to a screenshot and use `sandbox_annotate` in `image` mode, or pass
+`shapeCoordinates: "image"` to `sandbox_guide_step`.
 
 ## Client configuration
 

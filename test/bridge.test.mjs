@@ -18,6 +18,7 @@ process.env.SANDBOX_BRIDGE_ROOT = tmp;
 
 const fileBridge = await import("../dist/bridge.js");
 const socketBridge = await import("../dist/socket-bridge.js");
+const annotations = await import("../dist/annotations.js");
 
 const endpointPath = path.join(tmp, "results", "agent-endpoint.json");
 
@@ -110,6 +111,28 @@ test("socket bridge: a failed result surfaces as a thrown error", async () => {
   } finally {
     agent.close();
   }
+});
+
+test("annotation helper converts screenshot coordinates to screen coordinates", () => {
+  const shapes = [
+    {
+      type: "box",
+      coordinateSpace: "image",
+      rect: [100, 50, 200, 80],
+    },
+    {
+      type: "arrow",
+      coords: "image",
+      from: [10, 20],
+      to: [30, 40],
+    },
+  ];
+  const normalized = annotations.normalizeShapesToScreen(shapes, { left: 300, top: 40, scale: 0.5 });
+
+  assert.deepEqual(normalized[0].rect, [500, 140, 400, 160]);
+  assert.equal(normalized[0].coordinateSpace, undefined);
+  assert.deepEqual(normalized[1].from, [320, 80]);
+  assert.deepEqual(normalized[1].to, [360, 120]);
 });
 
 test.after(async () => {

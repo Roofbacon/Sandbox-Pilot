@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { annotate, runBridgeAction, bridgeRoot } from "./bridge.js";
 import * as fileBridge from "./bridge.js";
 import * as socketBridge from "./socket-bridge.js";
+import { normalizeShapesToScreen, type CoordinateSpace } from "./annotations.js";
 
 // Transport: "socket" (low latency, guest listens / host connects out) or the default
 // file bridge (shared folder; simpler but ~20s host->guest propagation).
@@ -288,6 +289,17 @@ server.registerTool(
 
 // ---- Annotation ----------------------------------------------------------
 
+const annotationTargetSchema = z
+  .object({
+    name: z.string().optional().describe("Match the element's Name (case-insensitive)."),
+    automationId: z.string().optional().describe("Match the element's AutomationId (exact)."),
+    controlType: z.string().optional().describe('Match control type, e.g. "Button", "CheckBox", "ListItem".'),
+    match: z.enum(["contains", "exact"]).default("contains").describe("How to match Name."),
+    scope: z.enum(["window", "desktop"]).default("window"),
+    timeoutMs: z.number().int().positive().default(3000).describe("Max time to wait for the target element."),
+  })
+  .passthrough();
+
 const shapeSchema = z
   .object({
     type: z.enum(["box", "arrow", "label", "spotlight"]),
@@ -301,8 +313,89 @@ const shapeSchema = z
     thickness: z.number().optional(),
     size: z.number().optional().describe("Label font size."),
     dim: z.number().optional().describe("Spotlight backdrop alpha 0-255."),
+    coordinateSpace: z
+      .enum(["screen", "image"])
+      .optional()
+      .describe("Coordinate space for this shape. 'screen' uses real Sandbox pixels; 'image' uses screenshot pixels."),
+    coords: z.enum(["screen", "image"]).optional().describe("Alias for coordinateSpace."),
+    target: annotationTargetSchema
+      .optional()
+      .describe("Resolve the current UIA element and use its rect/click point for this shape."),
+    fromTarget: annotationTargetSchema.optional().describe("Resolve an arrow start point from a UIA element."),
+    toTarget: annotationTargetSchema.optional().describe("Resolve an arrow tip from a UIA element."),
+    atTarget: annotationTargetSchema.optional().describe("Resolve a label position from a UIA element."),
+    padding: z.number().optional().describe("Pixels to expand a target-derived box/spotlight rect."),
   })
   .passthrough();
+
+async function resolveAnnotationTarget(target: any): Promise<any> {
+  if (!target?.name && !target?.automationId) {
+    throw new Error("Annotation target requires 'name' and/or 'automationId'.");
+  }
+  const timeoutMs = target.timeoutMs ?? 3000;
+  const result = await sendCommand(
+    "wait_for",
+    {
+      scope: target.scope ?? "window",
+      name: target.name ?? "",
+      automationId: target.automationId ?? "",
+      controlType: target.controlType ?? "",
+      match: target.match ?? "contains",
+      timeoutMs,
+      pollMs: 150,
+    },
+    timeoutMs + 5000,
+  );
+  if (!result.data?.satisfied || !result.data?.rect) {
+    throw new Error(`Annotation target was not found: ${target.name ?? target.automationId}`);
+  }
+  return result.data;
+}
+
+function paddedRect(rect: number[], padding = 0): number[] {
+  if (!padding) return rect;
+  return [rect[0] - padding, rect[1] - padding, rect[2] + 2 * padding, rect[3] + 2 * padding];
+}
+
+function centerOf(rect: number[]): number[] {
+  return [rect[0] + rect[2] / 2, rect[1] + rect[3] / 2];
+}
+
+async function resolveAnnotationShapes(shapes: any[]): Promise<any[]> {
+  const resolved: any[] = [];
+  for (const shape of shapes) {
+    const next = { ...shape };
+
+    if (next.target) {
+      const target = await resolveAnnotationTarget(next.target);
+      if ((next.type === "box" || next.type === "spotlight") && !next.rect) {
+        next.rect = paddedRect(target.rect, next.padding ?? 0);
+      }
+      if (next.type === "arrow" && !next.to) next.to = target.click ?? centerOf(target.rect);
+      if (next.type === "label" && !next.at) next.at = [target.rect[0], target.rect[1]];
+    }
+    if (next.fromTarget && !next.from) {
+      const target = await resolveAnnotationTarget(next.fromTarget);
+      next.from = target.click ?? centerOf(target.rect);
+    }
+    if (next.toTarget && !next.to) {
+      const target = await resolveAnnotationTarget(next.toTarget);
+      next.to = target.click ?? centerOf(target.rect);
+    }
+    if (next.atTarget && !next.at) {
+      const target = await resolveAnnotationTarget(next.atTarget);
+      next.at = [target.rect[0], target.rect[1]];
+    }
+
+    delete next.target;
+    delete next.fromTarget;
+    delete next.toTarget;
+    delete next.atTarget;
+    delete next.padding;
+    resolved.push(next);
+  }
+  return resolved;
+}
 
 server.registerTool(
   "sandbox_annotate",
@@ -322,7 +415,13 @@ server.registerTool(
     },
   },
   async ({ inputPath, mode, metadataPath, shapes, outputPath }) => {
-    const out = await annotate({ inputPath, mode, metadataPath, shapes, outputPath });
+    let drawShapes = shapes as any[];
+    if (mode === "screen") {
+      const metaPath = metadataPath ?? inputPath.replace(/\.jpg$/i, ".json");
+      const rawMeta = await fsp.readFile(metaPath, "utf8");
+      drawShapes = normalizeShapesToScreen(drawShapes, JSON.parse(rawMeta), "screen");
+    }
+    const out = await annotate({ inputPath, mode, metadataPath, shapes: drawShapes, outputPath });
     return {
       content: [
         { type: "image", data: out.base64, mimeType: out.mimeType },
@@ -427,18 +526,24 @@ server.registerTool(
   {
     title: "Record a guide step",
     description:
-      "Capture a screenshot, optionally annotate it (boxes/arrows/labels in real screen coords), " +
+      "Capture a screenshot, optionally annotate it (boxes/arrows/labels in real screen coords by default), " +
       "and append it as a numbered step with a caption to a named guide. Build the final document " +
-      "with sandbox_guide_build. Use window/region to focus the shot on the relevant UI.",
+      "with sandbox_guide_build. Use window/region to focus the shot on the relevant UI. Prefer " +
+      "target/toTarget/fromTarget selectors over hand-measured pixels; if you read coordinates from " +
+      "the screenshot itself, set shapeCoordinates='image' or coordinateSpace='image'.",
     inputSchema: {
       guide: z.string().describe("Guide name (a folder under bridge/guides)."),
       caption: z.string().describe("Instruction text shown above this step's screenshot."),
       window: z.boolean().optional().describe("Capture only the foreground window."),
       region: z.array(z.number()).length(4).optional().describe("[x,y,w,h] real-screen crop."),
-      shapes: z.array(shapeSchema).optional().describe("Optional annotations (screen-coord boxes/arrows/labels)."),
+      shapes: z.array(shapeSchema).optional().describe("Optional annotations. Defaults to screen coordinates."),
+      shapeCoordinates: z
+        .enum(["screen", "image"])
+        .default("screen")
+        .describe("Default coordinate space for shapes that do not set coordinateSpace."),
     },
   },
-  async ({ guide, caption, window, region, shapes }) => {
+  async ({ guide, caption, window, region, shapes, shapeCoordinates }) => {
     const dir = guideDirFor(guide);
     await fsp.mkdir(dir, { recursive: true });
     const steps = await readSteps(dir);
@@ -450,13 +555,17 @@ server.registerTool(
     await fsp.writeFile(rawPath, Buffer.from(shot.base64, "base64"));
 
     let image = `step-${nn}-raw.jpg`;
+    let resolvedShapes: any[] | undefined;
     if (shapes && shapes.length) {
       const outPath = path.join(dir, `step-${nn}.jpg`);
-      await annotate({ inputPath: rawPath, outputPath: outPath, shapes, mode: "screen", metadataPath: shot.metadataPath });
+      const screenShapes = normalizeShapesToScreen(shapes as any[], shot.meta, shapeCoordinates as CoordinateSpace);
+      resolvedShapes = await resolveAnnotationShapes(screenShapes);
+      await annotate({ inputPath: rawPath, outputPath: outPath, shapes: resolvedShapes, mode: "screen", metadataPath: shot.metadataPath });
       image = `step-${nn}.jpg`;
     }
 
-    steps.push({ n, caption, image });
+    const { imageBase64, ...capture } = shot.meta ?? {};
+    steps.push({ n, caption, image, capture, shapes: resolvedShapes });
     await fsp.writeFile(path.join(dir, "steps.json"), JSON.stringify(steps, null, 2), "utf8");
     return text({ guide, step: n, image, totalSteps: steps.length });
   },
