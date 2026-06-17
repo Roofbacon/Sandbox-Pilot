@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-import { annotate, runBridgeAction, bridgeRoot } from "./bridge.js";
+import { annotate, bridgeInfo, runBridgeAction, stageHostPath, toBridgeHostPath, bridgeRoot } from "./bridge.js";
 import * as fileBridge from "./bridge.js";
 import * as socketBridge from "./socket-bridge.js";
 
@@ -24,8 +24,7 @@ const text = (value: unknown) => ({
 });
 
 function bridgeHostPath(relativePath?: string | null): string | null {
-  if (!relativePath) return null;
-  return path.join(bridgeRoot, ...relativePath.split(/[\\/]+/).filter(Boolean));
+  return toBridgeHostPath(relativePath);
 }
 
 function addBridgeHostPaths(data: any): any {
@@ -40,6 +39,35 @@ function addBridgeHostPaths(data: any): any {
     }));
   }
   return data;
+}
+
+function looksLikeHostWindowsPath(value?: string | null): boolean {
+  return !!value && /^[a-zA-Z]:[\\/]/.test(value) && !/^C:[\\/]SandboxBridge(?:[\\/]|$)/i.test(value);
+}
+
+async function assertNoHostOnlyGuestPath(value: string | undefined, fieldName: string): Promise<void> {
+  if (!looksLikeHostWindowsPath(value)) return;
+  try {
+    await fsp.stat(value!);
+  } catch {
+    return;
+  }
+  throw new Error(
+    `${fieldName} points to a host path that the Windows Sandbox cannot see: ${value}. ` +
+      "Use sandbox_stage_host_path first, or use sandbox_intune_package_from_host for Intune packaging.",
+  );
+}
+
+async function copyPackagesToHostFolder(packages: any[], outputHostFolder: string): Promise<any[]> {
+  await fsp.mkdir(outputHostFolder, { recursive: true });
+  const copied = [];
+  for (const pkg of packages) {
+    if (!pkg.hostPath) continue;
+    const destination = path.join(outputHostFolder, path.basename(pkg.hostPath));
+    await fsp.copyFile(pkg.hostPath, destination);
+    copied.push({ ...pkg, hostPath: destination });
+  }
+  return copied;
 }
 
 // ---- Sensing -------------------------------------------------------------
@@ -277,9 +305,44 @@ server.registerTool(
   {
     title: "Run PowerShell in the Sandbox",
     description: "Run a PowerShell command inside the Sandbox and return its text output.",
-    inputSchema: { command: z.string() },
+    inputSchema: {
+      command: z.string(),
+      timeoutMs: z.number().int().positive().default(60000).describe("Maximum time to wait for the command result."),
+    },
   },
-  async ({ command }) => text((await sendCommand("run_ps", { command }, 60000)).data),
+  async ({ command, timeoutMs }) => text((await sendCommand("run_ps", { command, timeoutMs }, timeoutMs + 5000)).data),
+);
+
+server.registerTool(
+  "sandbox_bridge_info",
+  {
+    title: "Show Sandbox bridge paths",
+    description:
+      "Return the active host and guest bridge paths, transport mode, artifact folders, and writability. " +
+      "Use this when a task needs files copied into or out of the Sandbox.",
+    inputSchema: {},
+  },
+  async () => text(await bridgeInfo()),
+);
+
+server.registerTool(
+  "sandbox_stage_host_path",
+  {
+    title: "Stage a host file or folder into the Sandbox bridge",
+    description:
+      "Copy a host file or folder into the shared bridge processed folder and return both host and guest paths. " +
+      "Use this before invoking guest-only tools when the original path is on a host drive such as W:\\ or C:\\Users.",
+    inputSchema: {
+      hostPath: z.string().describe("Host file or folder to copy into the Sandbox bridge."),
+      destinationName: z
+        .string()
+        .optional()
+        .describe("Optional destination folder/file name under bridge\\processed. Defaults to the source basename."),
+      overwrite: z.boolean().default(true).describe("Replace an existing staged destination with the same name."),
+    },
+  },
+  async ({ hostPath, destinationName, overwrite }) =>
+    text(await stageHostPath({ hostPath, destinationName, overwrite })),
 );
 
 server.registerTool(
@@ -295,7 +358,10 @@ server.registerTool(
       recurse: z.boolean().default(true).describe("Scan recursively."),
     },
   },
-  async ({ path, recurse }) => text((await sendCommand("installer_candidates", { path, recurse }, 60000)).data),
+  async ({ path, recurse }) => {
+    await assertNoHostOnlyGuestPath(path, "path");
+    return text((await sendCommand("installer_candidates", { path, recurse }, 60000)).data);
+  },
 );
 
 server.registerTool(
@@ -309,7 +375,10 @@ server.registerTool(
       path: z.string().describe("Guest path to an .msi file."),
     },
   },
-  async ({ path }) => text((await sendCommand("msi_inspect", { path }, 60000)).data),
+  async ({ path }) => {
+    await assertNoHostOnlyGuestPath(path, "path");
+    return text((await sendCommand("msi_inspect", { path }, 60000)).data);
+  },
 );
 
 server.registerTool(
@@ -325,7 +394,10 @@ server.registerTool(
       recurse: z.boolean().default(true).describe("Scan recursively."),
     },
   },
-  async ({ path, recurse }) => text((await sendCommand("installer_analyze", { path, recurse }, 90000)).data),
+  async ({ path, recurse }) => {
+    await assertNoHostOnlyGuestPath(path, "path");
+    return text((await sendCommand("installer_analyze", { path, recurse }, 90000)).data);
+  },
 );
 
 server.registerTool(
@@ -353,6 +425,76 @@ server.registerTool(
         )
       ).data,
     ),
+);
+
+server.registerTool(
+  "sandbox_intune_package_from_host",
+  {
+    title: "Stage and package a host folder for Intune",
+    description:
+      "Copy a host source folder into the Sandbox bridge, run IntuneWinAppUtil.exe inside the Sandbox, " +
+      "and return .intunewin package host paths plus Intune deployment metadata. " +
+      "Use this for normal host paths such as W:\\Software\\App or C:\\Users\\... without manually finding the bridge.",
+    inputSchema: {
+      sourceHostFolder: z.string().describe("Host folder containing all source files to package."),
+      setupFile: z.string().describe("Setup file inside sourceHostFolder, relative path preferred."),
+      destinationName: z
+        .string()
+        .optional()
+        .describe("Optional staging folder name under bridge\\processed. Defaults to the source folder basename."),
+      outputHostFolder: z
+        .string()
+        .optional()
+        .describe("Optional host folder to copy the final .intunewin package(s) into after packaging."),
+      installCommand: z.string().optional().describe("Optional Intune install command to carry into the summary."),
+      uninstallCommand: z.string().optional().describe("Optional Intune uninstall command to carry into the summary."),
+      ensureTool: z.boolean().default(true).describe("Download the official tool if it is missing."),
+      toolPath: z.string().optional().describe("Optional guest path to an existing IntuneWinAppUtil.exe."),
+      downloadUrl: z
+        .string()
+        .optional()
+        .describe("Optional Microsoft GitHub URL override. Defaults to the official raw IntuneWinAppUtil.exe URL."),
+      quiet: z.boolean().default(true).describe("Pass -q to IntuneWinAppUtil.exe."),
+      includeCatalog: z.boolean().default(false).describe("Pass -a to include catalog files."),
+      timeoutMs: z.number().int().positive().default(300000).describe("Packaging timeout in milliseconds."),
+    },
+  },
+  async (args) => {
+    const staged = await stageHostPath({
+      hostPath: args.sourceHostFolder,
+      destinationName: args.destinationName,
+      overwrite: true,
+    });
+    const packageResult = addBridgeHostPaths(
+      (
+        await sendCommand(
+          "intune_package",
+          {
+            sourceFolder: staged.guestPath,
+            setupFile: args.setupFile,
+            installCommand: args.installCommand,
+            uninstallCommand: args.uninstallCommand,
+            ensureTool: args.ensureTool,
+            toolPath: args.toolPath,
+            downloadUrl: args.downloadUrl,
+            quiet: args.quiet,
+            includeCatalog: args.includeCatalog,
+            timeoutMs: args.timeoutMs,
+          },
+          Math.max(args.timeoutMs ?? 300000, 1000) + 30000,
+        )
+      ).data,
+    );
+    let copiedPackages: any[] = [];
+    if (args.outputHostFolder) {
+      copiedPackages = await copyPackagesToHostFolder(packageResult.packages ?? [], args.outputHostFolder);
+    }
+    return text({
+      stagedSource: staged,
+      packaging: packageResult,
+      copiedPackages,
+    });
+  },
 );
 
 server.registerTool(
@@ -406,17 +548,21 @@ server.registerTool(
     },
   },
   async (args) =>
-    text(
-      addBridgeHostPaths(
-        (
-          await sendCommand(
-            "intune_package",
-            args,
-            Math.max(args.timeoutMs ?? 300000, 1000) + 30000,
-          )
-        ).data,
-      ),
-    ),
+    {
+      await assertNoHostOnlyGuestPath(args.sourceFolder, "sourceFolder");
+      await assertNoHostOnlyGuestPath(args.outputFolder, "outputFolder");
+      return text(
+        addBridgeHostPaths(
+          (
+            await sendCommand(
+              "intune_package",
+              args,
+              Math.max(args.timeoutMs ?? 300000, 1000) + 30000,
+            )
+          ).data,
+        ),
+      );
+    },
 );
 
 server.registerTool(

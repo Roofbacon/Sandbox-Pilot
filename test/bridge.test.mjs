@@ -80,6 +80,24 @@ test("file bridge strips a UTF-8 BOM from the result JSON", async () => {
   }
 });
 
+test("stageHostPath copies host folders into processed and returns guest path", async () => {
+  const source = path.join(tmp, "host-source");
+  await fsp.mkdir(path.join(source, "nested"), { recursive: true });
+  await fsp.writeFile(path.join(source, "nested", "app.txt"), "hello");
+
+  const staged = await fileBridge.stageHostPath({
+    hostPath: source,
+    destinationName: "example app",
+    overwrite: true,
+  });
+
+  assert.equal(staged.destinationName, "example_app");
+  assert.equal(staged.guestPath, "C:\\SandboxBridge\\processed\\example_app");
+  assert.equal(staged.fileCount, 1);
+  assert.equal(staged.totalBytes, 5);
+  assert.equal(await fsp.readFile(path.join(staged.hostPath, "nested", "app.txt"), "utf8"), "hello");
+});
+
 test("socket bridge: sends the auth token first and reassembles chunk-split NDJSON", async () => {
   const token = "tok-" + randomUUID();
   const agent = makeFakeAgent((sock, cmd) => {

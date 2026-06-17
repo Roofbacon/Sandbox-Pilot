@@ -19,6 +19,7 @@ export const projectRoot = path.resolve(bridgeRoot, "..");
 const commandsDir = path.join(bridgeRoot, "commands");
 const resultsDir = path.join(bridgeRoot, "results");
 const screenshotsDir = path.join(bridgeRoot, "artifacts", "screenshots");
+const processedDir = path.join(bridgeRoot, "processed");
 
 const sandboxBridgePs1 =
   process.env.SANDBOX_BRIDGE_PS1 ?? path.join(projectRoot, "host", "SandboxBridge.ps1");
@@ -34,6 +35,150 @@ export interface BridgeResult {
   data: any;
   artifacts: string[];
   error: string | null;
+}
+
+export function toBridgeHostPath(relativePath?: string | null): string | null {
+  if (!relativePath) return null;
+  return path.join(bridgeRoot, ...relativePath.split(/[\\/]+/).filter(Boolean));
+}
+
+export function toBridgeGuestPath(relativePath: string): string {
+  const clean = relativePath.split(/[\\/]+/).filter(Boolean).join("\\");
+  return clean ? `C:\\SandboxBridge\\${clean}` : "C:\\SandboxBridge";
+}
+
+function sanitizeStageName(name: string): string {
+  const sanitized = name.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
+  return sanitized || `staged-${randomUUID()}`;
+}
+
+export async function bridgeInfo(): Promise<any> {
+  const exists = fs.existsSync(bridgeRoot);
+  const configPath = path.join(bridgeRoot, "ai-control.wsb");
+  const endpointPath = path.join(resultsDir, "agent-endpoint.json");
+  return {
+    hostBridgeRoot: bridgeRoot,
+    guestBridgeRoot: "C:\\SandboxBridge",
+    projectRoot,
+    sandboxBridgePs1,
+    transport: process.env.SANDBOX_TRANSPORT === "socket" ? "socket" : "file",
+    writable: exists ? await canWriteDirectory(bridgeRoot) : false,
+    paths: {
+      commands: commandsDir,
+      results: resultsDir,
+      processed: processedDir,
+      artifacts: path.join(bridgeRoot, "artifacts"),
+      intuneArtifacts: path.join(bridgeRoot, "artifacts", "intune"),
+      tools: path.join(bridgeRoot, "tools"),
+      config: configPath,
+      socketEndpoint: endpointPath,
+    },
+    guestPaths: {
+      processed: "C:\\SandboxBridge\\processed",
+      artifacts: "C:\\SandboxBridge\\artifacts",
+      intuneArtifacts: "C:\\SandboxBridge\\artifacts\\intune",
+      tools: "C:\\SandboxBridge\\tools",
+    },
+    configExists: fs.existsSync(configPath),
+    socketEndpointExists: fs.existsSync(endpointPath),
+  };
+}
+
+async function canWriteDirectory(dir: string): Promise<boolean> {
+  try {
+    await fsp.mkdir(dir, { recursive: true });
+    const probe = path.join(dir, `.write-test-${randomUUID()}`);
+    await fsp.writeFile(probe, "ok", "utf8");
+    await fsp.rm(probe, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function assertSafeBridgeDestination(destination: string): void {
+  const resolved = path.resolve(destination);
+  const allowed = path.resolve(processedDir) + path.sep;
+  if (resolved !== path.resolve(processedDir) && !resolved.startsWith(allowed)) {
+    throw new Error(`Refusing to stage outside the bridge processed folder: ${resolved}`);
+  }
+}
+
+export async function stageHostPath(opts: {
+  hostPath: string;
+  destinationName?: string;
+  overwrite?: boolean;
+}): Promise<any> {
+  const source = path.resolve(opts.hostPath);
+  let stat;
+  try {
+    stat = await fsp.stat(source);
+  } catch {
+    throw new Error(`Host path does not exist: ${opts.hostPath}`);
+  }
+
+  const destinationName = sanitizeStageName(opts.destinationName ?? path.basename(source));
+  const relativePath = path.join("processed", destinationName);
+  const destination = path.join(bridgeRoot, relativePath);
+  assertSafeBridgeDestination(destination);
+
+  const sourceWithSep = source.endsWith(path.sep) ? source : source + path.sep;
+  const destinationWithSep = destination.endsWith(path.sep) ? destination : destination + path.sep;
+  if (destinationWithSep.startsWith(sourceWithSep)) {
+    throw new Error("Refusing to stage a folder into itself. Choose a destination outside the source path.");
+  }
+
+  const overwrite = opts.overwrite ?? true;
+  if (overwrite) {
+    await fsp.rm(destination, { recursive: true, force: true });
+  } else if (fs.existsSync(destination)) {
+    throw new Error(`Destination already exists: ${destination}`);
+  }
+  await fsp.mkdir(path.dirname(destination), { recursive: true });
+
+  if (stat.isDirectory()) {
+    await fsp.cp(source, destination, { recursive: true, force: true, errorOnExist: false });
+  } else if (stat.isFile()) {
+    await fsp.copyFile(source, destination);
+  } else {
+    throw new Error(`Host path is neither a file nor a directory: ${opts.hostPath}`);
+  }
+
+  const stagedStats = await collectStagedStats(destination);
+  return {
+    sourceHostPath: source,
+    hostPath: destination,
+    guestPath: toBridgeGuestPath(relativePath),
+    bridgeRelativePath: relativePath,
+    destinationName,
+    type: stat.isDirectory() ? "directory" : "file",
+    overwrite,
+    ...stagedStats,
+  };
+}
+
+async function collectStagedStats(target: string): Promise<{ fileCount: number; totalBytes: number }> {
+  const stat = await fsp.stat(target);
+  if (stat.isFile()) return { fileCount: 1, totalBytes: stat.size };
+
+  let fileCount = 0;
+  let totalBytes = 0;
+  const pending = [target];
+  while (pending.length) {
+    const dir = pending.pop()!;
+    const entries = await fsp.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(full);
+      } else if (entry.isFile()) {
+        const fileStat = await fsp.stat(full);
+        fileCount += 1;
+        totalBytes += fileStat.size;
+      }
+    }
+  }
+  return { fileCount, totalBytes };
 }
 
 /** Map a guest path (C:\SandboxBridge\artifacts\screenshots\x.jpg) to the host screenshot folder. */

@@ -191,7 +191,7 @@ function Get-InstalledPrograms {
 
     $programs = foreach ($path in $registryPaths) {
         Get-ItemProperty -Path $path -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName } |
+            Where-Object { Get-ObjectPropertyValue -Object $_ -Name "DisplayName" } |
             Select-Object DisplayName, DisplayVersion, Publisher, InstallDate, InstallLocation, UninstallString
     }
 
@@ -214,6 +214,19 @@ function Get-DefaultDownloadsPath {
 function ConvertTo-InstallerCommandLiteral {
     param([string]$Value)
     return '"' + ($Value -replace '"', '\"') + '"'
+}
+
+function Get-ObjectPropertyValue {
+    param($Object, [string]$Name, $Default = $null)
+
+    if ($null -eq $Object -or -not $Name) { return $Default }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) { return $Object[$Name] }
+        return $Default
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($property) { return $property.Value }
+    return $Default
 }
 
 function Get-FileStringSample {
@@ -300,7 +313,7 @@ function Get-MsiInfo {
         $database = $installer.OpenDatabase($Path, 0)
         $properties = Get-MsiPropertyMap -Database $database
         $publicProperties = @()
-        foreach ($name in ($properties.Keys | Sort-Object)) {
+        foreach ($name in @($properties.GetEnumerator() | ForEach-Object { $_.Key } | Sort-Object)) {
             if ($name -cmatch '^[A-Z0-9_]+$') {
                 $publicProperties += [ordered]@{ name = $name; value = $properties[$name] }
             }
@@ -312,13 +325,13 @@ function Get-MsiInfo {
         return [ordered]@{
             path = $file.FullName
             file = $file.Name
-            productName = $properties["ProductName"]
-            productVersion = $properties["ProductVersion"]
-            productCode = $properties["ProductCode"]
-            upgradeCode = $properties["UpgradeCode"]
-            manufacturer = $properties["Manufacturer"]
-            allUsers = $properties["ALLUSERS"]
-            reboot = $properties["REBOOT"]
+            productName = Get-ObjectPropertyValue -Object $properties -Name "ProductName"
+            productVersion = Get-ObjectPropertyValue -Object $properties -Name "ProductVersion"
+            productCode = Get-ObjectPropertyValue -Object $properties -Name "ProductCode"
+            upgradeCode = Get-ObjectPropertyValue -Object $properties -Name "UpgradeCode"
+            manufacturer = Get-ObjectPropertyValue -Object $properties -Name "Manufacturer"
+            allUsers = Get-ObjectPropertyValue -Object $properties -Name "ALLUSERS"
+            reboot = Get-ObjectPropertyValue -Object $properties -Name "REBOOT"
             publicProperties = @($publicProperties)
             notableProperties = @($notable)
             suggestedSilentCommand = "msiexec /i " + (ConvertTo-InstallerCommandLiteral $file.FullName) + " /qn /norestart /L*v " + (ConvertTo-InstallerCommandLiteral ('$env:TEMP\' + $base + "-install.log"))
@@ -442,11 +455,12 @@ function Get-InstallerFolderAnalysis {
     }
 
     $recommendedCommands = foreach ($msi in $msis) {
-        if ($msi.suggestedSilentCommand) {
+        $command = Get-ObjectPropertyValue -Object $msi -Name "suggestedSilentCommand"
+        if ($command) {
             [ordered]@{
-                file = $msi.file
-                productName = $msi.productName
-                command = $msi.suggestedSilentCommand
+                file = Get-ObjectPropertyValue -Object $msi -Name "file"
+                productName = Get-ObjectPropertyValue -Object $msi -Name "productName"
+                command = $command
                 confidence = "high"
             }
         }
@@ -1641,8 +1655,12 @@ function Invoke-AgentCommand {
             return @{ data = @{ opened = $target; windows = @($windows); warning = $warning } }
         }
         "run_ps" {
-            $output = Invoke-Expression ([string]$args.command) *>&1 | Out-String
-            return @{ data = @{ output = $output; shell = "powershell" } }
+            $command = [string](Get-ArgValue $args "command" "")
+            $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 60000)
+            $wrappedCommand = '$ProgressPreference = "SilentlyContinue"; ' + $command
+            $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($wrappedCommand))
+            $result = Invoke-CapturedProcess -FilePath "powershell.exe" -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encoded) -TimeoutMs $timeoutMs
+            return @{ data = @{ output = (($result.stdout + $result.stderr) | Out-String); shell = "powershell"; exitCode = $result.exitCode; timedOut = $result.timedOut; timeoutMs = $result.timeoutMs; stdout = $result.stdout; stderr = $result.stderr } }
         }
         "run_cmd" {
             $output = & cmd.exe /c ([string]$args.command) 2>&1 | Out-String
