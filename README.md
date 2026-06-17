@@ -28,9 +28,11 @@ Sandbox Pilot exposes [Windows Sandbox](https://learn.microsoft.com/en-us/window
 | **Document** | `sandbox_annotate` (boxes/arrows/labels/spotlight), `sandbox_guide_step` + `sandbox_guide_build` + `sandbox_guide_reset` |
 | **Lifecycle** | `sandbox_prepare` (one call to a control-ready Sandbox), `sandbox_status` |
 
-> Example output: the guide builder turns a sequence of captioned, annotated screenshots into a Markdown document — see [`examples/windows-language-guide`](examples/windows-language-guide).
+> Example output: the guide builder turns a sequence of captioned, annotated screenshots into a Markdown document.
+> - [`examples/windows-language-guide`](examples/windows-language-guide) — plain captured steps (change the Windows display language).
+> - [`examples/annotated-printer-guide`](examples/annotated-printer-guide) — the **annotation** feature in action: boxes, arrows and labels drawn straight onto the screenshots, placed from the same pixel rectangles the AI uses to click.
 
-![A captured Settings step](examples/windows-language-guide/images/01-language-and-region.jpg)
+![An annotated Settings step — the Add device button is boxed and arrowed](examples/annotated-printer-guide/images/01-add-device.jpg)
 
 ## How it works
 
@@ -188,7 +190,7 @@ Sandbox-Pilot/
 ├─ host/              # SandboxBridge.ps1 (lifecycle + CLI), AnnotateScreenshot.ps1
 ├─ guest/             # SandboxAgent.ps1 — the in-Sandbox agent (source of truth)
 ├─ bridge/            # mapped host<->guest folder: source helpers (+ runtime files, gitignored)
-├─ examples/          # a generated guide (Windows display-language change)
+├─ examples/          # generated guides (display-language change; annotated printer guide)
 ├─ docs/SERVER.md     # detailed server/transport reference
 ├─ package.json       # bin: sandbox-pilot -> dist/index.js
 └─ setup.ps1          # one-command local setup
