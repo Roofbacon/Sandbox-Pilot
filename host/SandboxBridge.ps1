@@ -131,11 +131,49 @@ function Get-DefaultSandboxId {
     throw "No running Windows Sandbox session found. Start one first or run the start action."
 }
 
+function Close-SandboxViewerWindows {
+    # Close the host-side RDP viewer before destroying/reconnecting the VM. If the VM is
+    # stopped while the viewer is still attached, Windows Sandbox shows a reconnect prompt.
+    $closed = 0
+    $killed = 0
+    $processes = @(Get-Process -Name "WindowsSandboxRemoteSession" -ErrorAction SilentlyContinue)
+
+    foreach ($proc in $processes) {
+        try {
+            if ($proc.MainWindowHandle -ne 0) {
+                if ($proc.CloseMainWindow()) { $closed++ }
+            }
+        }
+        catch { }
+    }
+
+    if ($closed -gt 0) { Start-Sleep -Milliseconds 700 }
+
+    foreach ($proc in $processes) {
+        try {
+            $current = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
+            if ($current) {
+                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                $killed++
+            }
+        }
+        catch { }
+    }
+
+    [pscustomobject]@{
+        matched = $processes.Count
+        closeRequested = $closed
+        killed = $killed
+    }
+}
+
 function Stop-Sandbox {
     # Destroy the Sandbox VM (a real reset — all guest state is wiped). `wsb` starts the VM
     # detached, so closing the interactive window only closes the viewer; the VM keeps running
     # until it is explicitly stopped here. With no -TargetSandboxId, stops every running one.
     param([string]$TargetSandboxId)
+
+    $viewer = Close-SandboxViewerWindows
 
     $ids = @()
     if ($TargetSandboxId) {
@@ -162,6 +200,7 @@ function Stop-Sandbox {
     [pscustomobject]@{
         stopped = $stopped
         count = $stopped.Count
+        viewer = $viewer
     }
 }
 
@@ -222,10 +261,12 @@ function Connect-SandboxWindow {
         $TargetSandboxId = Get-DefaultSandboxId
     }
 
+    $viewer = Close-SandboxViewerWindows
     Start-Process -FilePath "wsb.exe" -ArgumentList @("connect", "--id", $TargetSandboxId) | Out-Null
     [pscustomobject]@{
         sandboxId = $TargetSandboxId
         connected = $true
+        previousViewer = $viewer
         note = "Wait for the Windows Sandbox window to finish opening/resizing before taking screenshots."
     }
 }
@@ -428,7 +469,7 @@ function Reload-SocketAgent {
     while (-not (Test-Path $endpoint) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
 
     # Killing PowerShell drops the interactive session to 200x200; reconnect + resize for real capture.
-    Start-Process -FilePath "wsb.exe" -ArgumentList @("connect", "--id", $TargetSandboxId) | Out-Null
+    Connect-SandboxWindow -TargetSandboxId $TargetSandboxId | Out-Null
     Start-Sleep -Seconds 6
     $resolution = $null
     try { $resolution = Set-SandboxResolution } catch { }
