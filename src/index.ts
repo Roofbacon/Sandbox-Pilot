@@ -413,6 +413,7 @@ server.registerTool(
       timeoutMs: z.number().int().positive().default(120000).describe("Maximum time to wait before killing the process tree."),
       logPath: z.string().optional().describe("Optional expected installer log path to tail."),
       logTailLines: z.number().int().positive().default(80).describe("Number of lines to include from the main log."),
+      workingDirectory: z.string().optional().describe("Optional guest working directory to run the command from."),
     },
   },
   async (args) =>
@@ -448,6 +449,11 @@ server.registerTool(
         .describe("Optional host folder to copy the final .intunewin package(s) into after packaging."),
       installCommand: z.string().optional().describe("Optional Intune install command to carry into the summary."),
       uninstallCommand: z.string().optional().describe("Optional Intune uninstall command to carry into the summary."),
+      testInstall: z
+        .boolean()
+        .default(true)
+        .describe("Run the install command in the Sandbox before packaging; packaging is skipped if the test fails."),
+      installTestTimeoutMs: z.number().int().positive().default(90000).describe("Install preflight timeout in milliseconds."),
       ensureTool: z.boolean().default(true).describe("Download the official tool if it is missing."),
       toolPath: z.string().optional().describe("Optional guest path to an existing IntuneWinAppUtil.exe."),
       downloadUrl: z
@@ -474,6 +480,8 @@ server.registerTool(
             setupFile: args.setupFile,
             installCommand: args.installCommand,
             uninstallCommand: args.uninstallCommand,
+            testInstall: args.testInstall,
+            installTestTimeoutMs: args.installTestTimeoutMs,
             ensureTool: args.ensureTool,
             toolPath: args.toolPath,
             downloadUrl: args.downloadUrl,
@@ -481,7 +489,7 @@ server.registerTool(
             includeCatalog: args.includeCatalog,
             timeoutMs: args.timeoutMs,
           },
-          Math.max(args.timeoutMs ?? 300000, 1000) + 30000,
+          Math.max(args.timeoutMs ?? 300000, args.installTestTimeoutMs ?? 90000, 1000) + 30000,
         )
       ).data,
     );
@@ -536,6 +544,11 @@ server.registerTool(
         .describe("Guest output folder. Defaults to C:\\SandboxBridge\\artifacts\\intune."),
       installCommand: z.string().optional().describe("Optional Intune install command to carry into the summary."),
       uninstallCommand: z.string().optional().describe("Optional Intune uninstall command to carry into the summary."),
+      testInstall: z
+        .boolean()
+        .default(true)
+        .describe("Run the install command in the Sandbox before packaging; packaging is skipped if the test fails."),
+      installTestTimeoutMs: z.number().int().positive().default(90000).describe("Install preflight timeout in milliseconds."),
       ensureTool: z.boolean().default(true).describe("Download the official tool if it is missing."),
       toolPath: z.string().optional().describe("Optional guest path to an existing IntuneWinAppUtil.exe."),
       downloadUrl: z
@@ -557,7 +570,7 @@ server.registerTool(
             await sendCommand(
               "intune_package",
               args,
-              Math.max(args.timeoutMs ?? 300000, 1000) + 30000,
+              Math.max(args.timeoutMs ?? 300000, args.installTestTimeoutMs ?? 90000, 1000) + 30000,
             )
           ).data,
         ),

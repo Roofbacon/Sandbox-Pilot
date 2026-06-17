@@ -513,13 +513,14 @@ function Invoke-InstallerCommandTest {
         [string]$Command,
         [int]$TimeoutMs = 120000,
         [string]$LogPath = "",
-        [int]$LogTailLines = 80
+        [int]$LogTailLines = 80,
+        [string]$WorkingDirectory = ""
     )
 
     if (-not $Command) { throw "Command is required." }
     $started = Get-Date
     $beforePrograms = @(Get-InstalledPrograms)
-    $wrappedCommand = '$ProgressPreference = "SilentlyContinue"; ' + $Command
+    $wrappedCommand = '$ProgressPreference = "SilentlyContinue"; & { ' + $Command + ' }; if ($null -ne $global:LASTEXITCODE) { exit $global:LASTEXITCODE }'
     $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($wrappedCommand))
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = "powershell.exe"
@@ -528,6 +529,10 @@ function Invoke-InstallerCommandTest {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
+    if ($WorkingDirectory) {
+        if (-not (Test-Path -LiteralPath $WorkingDirectory)) { throw "workingDirectory does not exist: $WorkingDirectory" }
+        $psi.WorkingDirectory = (Resolve-Path -LiteralPath $WorkingDirectory).Path
+    }
 
     $process = [System.Diagnostics.Process]::Start($psi)
     $completed = $process.WaitForExit($TimeoutMs)
@@ -586,6 +591,7 @@ function Invoke-InstallerCommandTest {
         finishedAt = (Get-Date).ToString("o")
         timedOut = $timedOut
         timeoutMs = $TimeoutMs
+        workingDirectory = $psi.WorkingDirectory
         pid = $process.Id
         exitCode = $exitCode
         stdout = $stdout
@@ -835,7 +841,9 @@ function Invoke-IntuneWin32Package {
         [string]$DownloadUrl = "",
         [bool]$Quiet = $true,
         [bool]$IncludeCatalog = $false,
-        [int]$TimeoutMs = 300000
+        [int]$TimeoutMs = 300000,
+        [bool]$TestInstall = $true,
+        [int]$InstallTestTimeoutMs = 90000
     )
 
     if (-not $SourceFolder) { throw "sourceFolder is required." }
@@ -845,6 +853,47 @@ function Invoke-IntuneWin32Package {
     New-Item -ItemType Directory -Force -Path $OutputFolder | Out-Null
     $resolvedOutput = (Resolve-Path -LiteralPath $OutputFolder).Path
     $setup = Resolve-SetupFileForIntune -SourceFolder $resolvedSource -SetupFile $SetupFile
+    $metadata = Get-IntunePackagingMetadata -SetupPath $setup.path -InstallCommand $InstallCommand -UninstallCommand $UninstallCommand
+
+    $installTest = $null
+    if ($TestInstall) {
+        if (-not $metadata.installCommand) {
+            return [ordered]@{
+                sourceFolder = $resolvedSource
+                setupFile = $setup.relative
+                outputFolder = $resolvedOutput
+                tool = $null
+                process = $null
+                succeeded = $false
+                packages = @()
+                metadata = $metadata
+                installTest = [ordered]@{ skipped = $true; reason = "No install command was provided or inferred, so the package was not created." }
+                warning = "Install test was required but no install command was available."
+            }
+        }
+
+        $installTest = Invoke-InstallerCommandTest -Command $metadata.installCommand -TimeoutMs $InstallTestTimeoutMs -WorkingDirectory $resolvedSource
+        $successExitCodes = @(0, 1707, 3010, 1641)
+        $installTestPassed = ((-not $installTest.timedOut) -and ($null -ne $installTest.exitCode) -and ($successExitCodes -contains [int]$installTest.exitCode))
+        if (-not $installTestPassed) {
+            return [ordered]@{
+                sourceFolder = $resolvedSource
+                setupFile = $setup.relative
+                outputFolder = $resolvedOutput
+                tool = $null
+                process = $null
+                succeeded = $false
+                packages = @()
+                metadata = $metadata
+                installTest = $installTest
+                warning = "Install test failed or timed out; Intune package creation was skipped."
+            }
+        }
+    }
+    else {
+        $installTest = [ordered]@{ skipped = $true; reason = "testInstall was set to false." }
+    }
+
     $tool = Resolve-IntuneWinAppUtil -ToolPath $ToolPath -EnsureTool $EnsureTool -DownloadUrl $DownloadUrl
     if (-not $tool.available) { throw "IntuneWinAppUtil.exe was not found. Pass ensureTool=true to download it or provide toolPath." }
 
@@ -875,8 +924,6 @@ function Invoke-IntuneWin32Package {
                     lastWriteTime = $_.LastWriteTime.ToString("o")
                 }
             })
-    $metadata = Get-IntunePackagingMetadata -SetupPath $setup.path -InstallCommand $InstallCommand -UninstallCommand $UninstallCommand
-
     return [ordered]@{
         sourceFolder = $resolvedSource
         setupFile = $setup.relative
@@ -886,6 +933,7 @@ function Invoke-IntuneWin32Package {
         succeeded = ((-not $process.timedOut) -and ($process.exitCode -eq 0) -and ($packages.Count -gt 0))
         packages = @($packages)
         metadata = $metadata
+        installTest = $installTest
         warning = $(if ($packages.Count -eq 0) { "No .intunewin file was found in the output folder after packaging." } else { $null })
     }
 }
@@ -1376,7 +1424,8 @@ function Invoke-AgentCommand {
             $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 120000)
             $logPath = [string](Get-ArgValue $args "logPath" "")
             $logTailLines = [int](Get-ArgValue $args "logTailLines" 80)
-            return @{ data = (Invoke-InstallerCommandTest -Command $command -TimeoutMs $timeoutMs -LogPath $logPath -LogTailLines $logTailLines) }
+            $workingDirectory = [string](Get-ArgValue $args "workingDirectory" "")
+            return @{ data = (Invoke-InstallerCommandTest -Command $command -TimeoutMs $timeoutMs -LogPath $logPath -LogTailLines $logTailLines -WorkingDirectory $workingDirectory) }
         }
         "intune_prereqs" {
             $toolPath = [string](Get-ArgValue $args "toolPath" "")
@@ -1396,7 +1445,9 @@ function Invoke-AgentCommand {
             $quiet = [bool](Get-ArgValue $args "quiet" $true)
             $includeCatalog = [bool](Get-ArgValue $args "includeCatalog" $false)
             $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 300000)
-            return @{ data = (Invoke-IntuneWin32Package -SourceFolder $sourceFolder -SetupFile $setupFile -OutputFolder $outputFolder -InstallCommand $installCommand -UninstallCommand $uninstallCommand -ToolPath $toolPath -EnsureTool $ensureTool -DownloadUrl $downloadUrl -Quiet $quiet -IncludeCatalog $includeCatalog -TimeoutMs $timeoutMs) }
+            $testInstall = [bool](Get-ArgValue $args "testInstall" $true)
+            $installTestTimeoutMs = [int](Get-ArgValue $args "installTestTimeoutMs" 90000)
+            return @{ data = (Invoke-IntuneWin32Package -SourceFolder $sourceFolder -SetupFile $setupFile -OutputFolder $outputFolder -InstallCommand $installCommand -UninstallCommand $uninstallCommand -ToolPath $toolPath -EnsureTool $ensureTool -DownloadUrl $downloadUrl -Quiet $quiet -IncludeCatalog $includeCatalog -TimeoutMs $timeoutMs -TestInstall $testInstall -InstallTestTimeoutMs $installTestTimeoutMs) }
         }
         "processes" {
             $processes = Get-Process |

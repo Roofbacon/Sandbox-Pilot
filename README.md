@@ -27,7 +27,7 @@ Sandbox Pilot exposes [Windows Sandbox](https://learn.microsoft.com/en-us/window
 | **Synchronize** | `sandbox_wait_for` — block until a UI element appears/disappears (no guessed sleeps) |
 | **Bridge files** | `sandbox_bridge_info`, `sandbox_stage_host_path` - discover the active host/guest bridge and copy host files or folders into `C:\SandboxBridge\processed` |
 | **Installers** | `sandbox_find_install_candidates`, `sandbox_msi_inspect`, `sandbox_analyze_installers`, `sandbox_test_install_command` - inspect installer payloads, infer silent commands, and verify them in the disposable VM |
-| **Intune packaging** | `sandbox_intune_prereqs`, `sandbox_intune_package_win32`, `sandbox_intune_package_from_host` - auto-install Microsoft's Win32 Content Prep Tool if needed and save `.intunewin` packages to shared artifacts |
+| **Intune packaging** | `sandbox_intune_prereqs`, `sandbox_intune_package_win32`, `sandbox_intune_package_from_host` - test the install command in the disposable VM by default, auto-install Microsoft's Win32 Content Prep Tool if needed, and save `.intunewin` packages to shared artifacts |
 | **Document** | `sandbox_annotate` (boxes/arrows/labels/spotlight), `sandbox_guide_step` + `sandbox_guide_build` + `sandbox_guide_reset` |
 | **Lifecycle** | `sandbox_prepare` (one call to a control-ready Sandbox; `fresh=true` to force a clean boot), `sandbox_stop` (reset — destroy the VM), `sandbox_status` |
 
@@ -148,11 +148,11 @@ When you have a candidate silent command, run it through `sandbox_test_install_c
 
 ## Intune packaging workflow
 
-For a normal host folder, prefer `sandbox_intune_package_from_host`. It stages the host source folder, runs packaging inside the Sandbox, and returns host paths for the generated `.intunewin` packages. This avoids requiring the agent or user to know where the bridge folder lives.
+For a normal host folder, prefer `sandbox_intune_package_from_host`. It stages the host source folder, tests the install command from that staged source directory by default, runs packaging inside the Sandbox only after the test succeeds, and returns host paths for the generated `.intunewin` packages. This avoids requiring the agent or user to know where the bridge folder lives.
 
-Use `sandbox_intune_package_win32` after you have a source folder, setup file, and install/uninstall commands. If `IntuneWinAppUtil.exe` is missing, the tool can download the official Microsoft Win32 Content Prep Tool into `C:\SandboxBridge\tools`, keeping it outside the package source folder.
+Use `sandbox_intune_package_win32` after you have a source folder, setup file, and install/uninstall commands. By default it runs the install command first and skips package creation if that preflight times out or returns a non-success installer code; pass `testInstall: false` only when you intentionally need a package without an install smoke test. If `IntuneWinAppUtil.exe` is missing, the tool can download the official Microsoft Win32 Content Prep Tool into `C:\SandboxBridge\tools`, keeping it outside the package source folder.
 
-Generated `.intunewin` files are written to `C:\SandboxBridge\artifacts\intune` by default and returned with host paths under `bridge\artifacts\intune`, so the user can pick them up directly. The result also includes packaging stdout/stderr, the Intune install/uninstall command summary, an MSI product-code detection suggestion when applicable, and standard return-code recommendations.
+Generated `.intunewin` files are written to `C:\SandboxBridge\artifacts\intune` by default and returned with host paths under `bridge\artifacts\intune`, so the user can pick them up directly. The result also includes the install-test result, packaging stdout/stderr, the Intune install/uninstall command summary, an MSI product-code detection suggestion when applicable, and standard return-code recommendations.
 
 ## Transports
 
