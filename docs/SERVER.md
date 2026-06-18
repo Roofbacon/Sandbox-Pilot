@@ -35,7 +35,7 @@ Or use the repo-root helper, which also prints your MCP client config: `..\setup
 | `sandbox_open` | Launch an app / file / URI (incl. `ms-settings:` links). |
 | `sandbox_run_ps` | Run PowerShell in the Sandbox, return its output. |
 | `sandbox_winget_bootstrap` | Install WinGet into a vanilla Sandbox using Microsoft's `Microsoft.WinGet.Client` / `Repair-WinGetPackageManager` bootstrap flow. |
-| `sandbox_winget` | Run WinGet search/show/install/upgrade/uninstall/list inside the Sandbox, optionally bootstrapping WinGet first and adding automation-friendly agreement/noninteractive/silent flags. |
+| `sandbox_winget` | Run WinGet search/show/install/upgrade/uninstall/list inside the Sandbox. Pins the community `winget` source by default (msstore is opt-in), runs silent/non-interactive, applies action-aware timeouts, and returns a decoded `outcome` + exit code + cleaned output. |
 | `sandbox_find_install_candidates` | Scan Downloads or a supplied guest path for likely installer payloads and entry points, with technology detection and ranking. |
 | `sandbox_msi_inspect` | Inspect MSI Product metadata, public properties, notable reboot/config flags, and suggest a silent `msiexec /qn` command. |
 | `sandbox_analyze_installers` | Analyze an installer folder or extracted vendor bundle; returns entry points, MSI metadata, script evidence, recommended commands, and notes. |

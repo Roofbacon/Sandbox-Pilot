@@ -458,27 +458,42 @@ server.registerTool(
     title: "Run WinGet in the Sandbox",
     description:
       "Search, show, install, upgrade, uninstall, or list software with WinGet inside the Sandbox. " +
-      "Defaults are automation-friendly: exact package-id matching when a target is supplied, " +
-      "agreement flags, disabled interactivity, and silent installs.",
+      "Tuned for unattended Sandbox use: pins the community 'winget' source by default (so it never " +
+      "reaches into 'msstore', which needs a signed-in account and pops Store/login GUIs), exact " +
+      "package-id matching when a target is supplied, agreement flags, disabled interactivity, and " +
+      "silent install/upgrade. The result includes an interpreted 'outcome' (success | noop | " +
+      "notFound | needsInput | needsAttention | failed | timeout), the decoded winget exit code, a " +
+      "human 'message', and cleaned 'output' (progress-bar noise stripped). 'noop' (e.g. already " +
+      "installed, nothing to upgrade) reports succeeded=true. To target the Microsoft Store, set " +
+      "source='msstore' explicitly (expect it to fail in a disposable Sandbox).",
     inputSchema: {
       action: z.enum(["search", "show", "install", "upgrade", "uninstall", "list"]).describe("WinGet command to run."),
-      packageId: z.string().optional().describe("WinGet package id, passed with --id. Preferred for install/uninstall/upgrade."),
+      packageId: z.string().optional().describe("WinGet package id, passed with --id. Preferred for install/uninstall/upgrade. Run action=search first to find the exact id."),
       query: z.string().optional().describe("Free-text search or package query when packageId is not known."),
       exact: z
         .boolean()
         .optional()
         .describe("Add --exact. Defaults to true when packageId is supplied, false for free-text query searches."),
-      source: z.string().optional().describe("Optional WinGet source, for example winget."),
-      scope: z.enum(["machine", "user"]).optional().describe("Install scope, only used with action=install."),
-      silent: z.boolean().default(true).describe("Add --silent for installs."),
+      source: z.string().optional().describe("Explicit WinGet source (e.g. 'winget' or 'msstore'). Overrides the default winget-source pin."),
+      preferWingetSource: z
+        .boolean()
+        .default(true)
+        .describe("When no source is given, pin --source winget for search/show/install/upgrade to avoid the flaky msstore source. Set false to let WinGet query all sources."),
+      scope: z.enum(["machine", "user"]).optional().describe("Install scope, used with action=install or upgrade."),
+      silent: z.boolean().default(true).describe("Add --silent for install/upgrade."),
       acceptAgreements: z.boolean().default(true).describe("Accept source/package agreements where WinGet supports it."),
       disableInteractivity: z.boolean().default(true).describe("Add --disable-interactivity."),
-      customArgs: z.array(z.string()).optional().describe("Extra raw WinGet arguments appended last for advanced cases."),
-      timeoutMs: z.number().int().positive().default(300000).describe("Maximum time to wait for the WinGet command."),
+      customArgs: z.array(z.string()).optional().describe("Extra raw WinGet arguments appended last for advanced cases (e.g. --include-unknown, --force)."),
+      timeoutMs: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("Max time to wait. Omit/0 for an action-aware default: 600000 ms for install/upgrade/uninstall, 120000 ms for search/show/list."),
       ensureAvailable: z.boolean().default(true).describe("Bootstrap WinGet first if winget.exe is not available."),
     },
   },
-  async (args) => text((await sendCommand("winget", args, (args.timeoutMs ?? 300000) + 30000)).data),
+  async (args) => text((await sendCommand("winget", args, (args.timeoutMs && args.timeoutMs > 0 ? args.timeoutMs : 600000) + 30000)).data),
 );
 
 server.registerTool(

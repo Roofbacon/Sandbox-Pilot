@@ -54,5 +54,17 @@ test("WinGet tools are registered and use the supported Sandbox bootstrap path",
   assert.ok(advertisedCommands().includes("winget_bootstrap"));
   assert.ok(advertisedCommands().includes("winget"));
   assert.match(wingetBootstrapSrc, /Install-Module\s+-Name\s+Microsoft\.WinGet\.Client/);
-  assert.match(wingetBootstrapSrc, /Repair-WinGetPackageManager\s+-AllUsers/);
+  assert.match(wingetBootstrapSrc, /Repair-WinGetPackageManager[^\r\n]*-AllUsers/);
+});
+
+test("sandbox_winget pins the winget source by default and interprets exit codes", () => {
+  // The msstore source needs a signed-in account and pops GUIs, so unattended Sandbox runs
+  // default to the community 'winget' source and surface a decoded outcome to the caller.
+  assert.match(serverSrc, /preferWingetSource/);
+  assert.match(guestSrc, /function Get-WinGetExitInfo/);
+  assert.match(guestSrc, /PreferWingetSource/);
+  assert.match(guestSrc, /NO_APPLICABLE_INSTALLER/);
+  // The captured-process helper must drain stdout/stderr asynchronously to avoid the pipe-buffer
+  // deadlock that surfaces as bogus winget timeouts.
+  assert.match(guestSrc, /ReadToEndAsync\(\)/);
 });

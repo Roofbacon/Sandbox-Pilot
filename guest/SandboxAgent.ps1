@@ -815,6 +815,12 @@ function Invoke-InstallerCommandTest {
     }
 
     $process = [System.Diagnostics.Process]::Start($psi)
+    # Start draining stdout/stderr asynchronously BEFORE waiting. A child that fills the ~4 KB
+    # pipe buffer (winget's progress rendering is a classic offender) blocks on write while we
+    # block on WaitForExit -> deadlock that surfaces as a bogus timeout. Reading concurrently
+    # keeps the pipes empty so the child can run to completion.
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
     $completed = $process.WaitForExit($TimeoutMs)
     $timedOut = -not $completed
     if ($timedOut) {
@@ -822,8 +828,8 @@ function Invoke-InstallerCommandTest {
     }
     $stdout = ""
     $stderr = ""
-    try { $stdout = $process.StandardOutput.ReadToEnd() } catch { }
-    try { $stderr = $process.StandardError.ReadToEnd() } catch { }
+    try { $stdout = $stdoutTask.GetAwaiter().GetResult() } catch { }
+    try { $stderr = $stderrTask.GetAwaiter().GetResult() } catch { }
     $exitCode = $null
     if (-not $timedOut) { $exitCode = $process.ExitCode }
 
@@ -940,6 +946,12 @@ function Invoke-CapturedProcess {
     $psi.CreateNoWindow = $true
 
     $process = [System.Diagnostics.Process]::Start($psi)
+    # Start draining stdout/stderr asynchronously BEFORE waiting. A child that fills the ~4 KB
+    # pipe buffer (winget's progress rendering is a classic offender) blocks on write while we
+    # block on WaitForExit -> deadlock that surfaces as a bogus timeout. Reading concurrently
+    # keeps the pipes empty so the child can run to completion.
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
     $completed = $process.WaitForExit($TimeoutMs)
     $timedOut = -not $completed
     if ($timedOut) {
@@ -947,8 +959,8 @@ function Invoke-CapturedProcess {
     }
     $stdout = ""
     $stderr = ""
-    try { $stdout = $process.StandardOutput.ReadToEnd() } catch { }
-    try { $stderr = $process.StandardError.ReadToEnd() } catch { }
+    try { $stdout = $stdoutTask.GetAwaiter().GetResult() } catch { }
+    try { $stderr = $stderrTask.GetAwaiter().GetResult() } catch { }
     $exitCode = $null
     if (-not $timedOut) { $exitCode = $process.ExitCode }
 
@@ -962,6 +974,77 @@ function Invoke-CapturedProcess {
         stdout = $stdout
         stderr = $stderr
     }
+}
+
+function Get-WinGetExitInfo {
+    # Map WinGet's exit code to a human-readable outcome so callers can react instead of blindly
+    # retrying. Codes: github.com/microsoft/winget-cli/blob/master/doc/.../winget/returnCodes.md
+    param($ExitCode, [bool]$TimedOut = $false)
+
+    if ($TimedOut -or $null -eq $ExitCode) {
+        return [ordered]@{ code = $ExitCode; hex = $null; name = "TIMEOUT"; outcome = "timeout"; message = "WinGet did not finish before the timeout elapsed." }
+    }
+
+    $code = [int]$ExitCode
+    $hex = ('0x{0:X8}' -f ($code -band [uint32]::MaxValue))
+    $map = @{
+        '0x00000000' = @('OK', 'success', 'Completed successfully.')
+        '0x8A150014' = @('NO_PACKAGES_FOUND', 'notFound', 'No package matched the criteria. Try a broader query or sandbox_winget action=search.')
+        '0x8A150016' = @('MULTIPLE_PACKAGES_FOUND', 'needsInput', 'Multiple packages matched. Re-run with an exact packageId (search first to find the id).')
+        '0x8A150017' = @('NO_MANIFEST_FOUND', 'notFound', 'No manifest matched the criteria.')
+        '0x8A150061' = @('PACKAGE_ALREADY_INSTALLED', 'noop', 'The package is already installed; nothing to do.')
+        '0x8A15010D' = @('PACKAGE_ALREADY_INSTALLED', 'noop', 'A different version is already installed.')
+        '0x8A15010E' = @('HIGHER_VERSION_INSTALLED', 'noop', 'A higher version is already installed.')
+        '0x8A15002B' = @('NO_APPLICABLE_UPGRADE', 'noop', 'No applicable upgrade was found; the package is up to date.')
+        '0x8A15004F' = @('UPDATE_NOT_NEWER', 'noop', 'The available version is not newer than what is installed.')
+        '0x8A150050' = @('UPDATE_VERSION_UNKNOWN', 'needsAttention', 'Installed version is unknown; pass --include-unknown via customArgs to upgrade.')
+        '0x8A150068' = @('UPGRADE_PINNED', 'needsAttention', 'A pin prevents upgrading this package.')
+        '0x8A150010' = @('NO_APPLICABLE_INSTALLER', 'failed', 'No installer applies to this system (architecture/scope/locale). Try a different scope.')
+        '0x8A150011' = @('INSTALLER_HASH_MISMATCH', 'failed', 'Installer hash did not match the manifest.')
+        '0x8A150041' = @('PACKAGE_AGREEMENTS_NOT_ACCEPTED', 'failed', 'Package agreements were not accepted. Re-run with acceptAgreements=true.')
+        '0x8A150046' = @('SOURCE_AGREEMENTS_NOT_ACCEPTED', 'failed', 'Source agreements were not accepted. Re-run with acceptAgreements=true.')
+        '0x8A15001B' = @('MSSTORE_BLOCKED_BY_POLICY', 'failed', 'Microsoft Store client is blocked by policy. Use the winget source instead of msstore.')
+        '0x8A15001C' = @('MSSTORE_APP_BLOCKED_BY_POLICY', 'failed', 'Microsoft Store app is blocked by policy. Use the winget source instead of msstore.')
+        '0x8A15001E' = @('MSSTORE_INSTALL_FAILED', 'failed', 'Microsoft Store install failed. The msstore source needs a signed-in account and rarely works in a sandbox - use the winget source.')
+        '0x8A15007F' = @('MSSTORE_CATALOG_FAILED', 'failed', 'Could not reach the Store catalog. Use the winget source in a sandbox.')
+        '0x8A150081' = @('MSSTORE_DOWNLOAD_INFO_FAILED', 'failed', 'Could not get Store download info. Use the winget source in a sandbox.')
+        '0x8A150083' = @('MSSTORE_LICENSE_FAILED', 'failed', 'Could not retrieve the Store package license. Use the winget source in a sandbox.')
+        '0x8A150008' = @('DOWNLOAD_FAILED', 'failed', 'Downloading the installer failed. Check Sandbox networking/DNS (sandbox_set_google_dns may help).')
+        '0x8A15002E' = @('DOWNLOAD_SIZE_MISMATCH', 'failed', 'Downloaded installer size did not match the manifest.')
+        '0x8A150115' = @('INSTALLER_FAILED', 'failed', 'The installer returned a custom error code. Check the captured output.')
+        '0x8A15010C' = @('CANCELLED', 'failed', 'The operation was cancelled.')
+    }
+    if ($map.ContainsKey($hex)) {
+        $entry = $map[$hex]
+        return [ordered]@{ code = $code; hex = $hex; name = $entry[0]; outcome = $entry[1]; message = $entry[2] }
+    }
+    if ($code -eq 0) {
+        return [ordered]@{ code = 0; hex = $hex; name = 'OK'; outcome = 'success'; message = 'Completed successfully.' }
+    }
+    return [ordered]@{ code = $code; hex = $hex; name = 'UNKNOWN'; outcome = 'failed'; message = "WinGet exited with $code ($hex) - an installer-specific or undocumented code. Check the captured output." }
+}
+
+function Clear-WinGetNoise {
+    # WinGet redraws progress bars/spinners with ANSI escapes, carriage returns, and box-drawing
+    # glyphs. Captured raw, that is a wall of noise; strip it down to the meaningful final lines.
+    # Kept deliberately ASCII-only: this script is loaded by Windows PowerShell with no BOM, which
+    # would mangle literal Unicode, so progress glyphs are removed by range rather than matched.
+    param([string]$Text)
+    if (-not $Text) { return "" }
+    $clean = [regex]::Replace($Text, "\x1B\[[0-9;?]*[A-Za-z]", "")
+    $clean = $clean -replace "`r`n", "`n"                              # real newlines first, so the
+                                                                       # split below only sees bare \r redraws
+    $kept = New-Object System.Collections.Generic.List[string]
+    foreach ($raw in ($clean -split "`n")) {
+        $line = ($raw -split "`r")[-1]                                 # keep the final redraw of the line
+        $line = [regex]::Replace($line, '[^\x20-\x7E\t]', '')          # drop non-ASCII bar/spinner glyphs
+        $trimmed = $line.Trim()
+        if (-not $trimmed) { continue }
+        if ($trimmed -match '^[\-\\|/.]+$') { continue }               # spinner-only line
+        if ($trimmed -match '^\d+(\.\d+)?\s*[KMG]?B\s*/') { continue } # bare "12.3 MB / 45 MB" counter
+        $kept.Add($line.TrimEnd())
+    }
+    return (($kept -join "`n") -replace "(`n){3,}", "`n`n").Trim()
 }
 
 function Resolve-WinGetPath {
@@ -1043,18 +1126,24 @@ function Invoke-SandboxWinGet {
         [bool]$Silent = $true,
         [bool]$AcceptAgreements = $true,
         [bool]$DisableInteractivity = $true,
+        [bool]$PreferWingetSource = $true,
         [string[]]$CustomArgs = @(),
-        [int]$TimeoutMs = 300000,
+        [int]$TimeoutMs = 0,
         [bool]$EnsureAvailable = $true
     )
 
     $allowed = @("search", "show", "install", "upgrade", "uninstall", "list")
     if ($allowed -notcontains $Action) { throw "Unsupported winget action '$Action'. Use one of: $($allowed -join ', ')." }
 
+    # Action-aware default timeout: queries are quick; installs/upgrades can be slow downloads.
+    if ($TimeoutMs -le 0) {
+        $TimeoutMs = if (@("install", "upgrade", "uninstall") -contains $Action) { 600000 } else { 120000 }
+    }
+
     $bootstrap = $null
     $status = Get-WinGetStatus
     if (-not $status.available -and $EnsureAvailable) {
-        $bootstrap = Invoke-WinGetBootstrap -SkipIfAvailable $true -TimeoutMs $TimeoutMs
+        $bootstrap = Invoke-WinGetBootstrap -SkipIfAvailable $true -TimeoutMs ([Math]::Max($TimeoutMs, 300000))
         $status = Get-WinGetStatus
     }
     if (-not $status.available) {
@@ -1076,25 +1165,42 @@ function Invoke-SandboxWinGet {
     }
 
     if ($Exact -and $target) { $wingetArgs += "--exact" }
-    if ($Source) { $wingetArgs += @("--source", $Source) }
+
+    # Pin to the community 'winget' source by default. Left unset, WinGet also reaches into
+    # 'msstore', which needs a signed-in Microsoft account, pops Store/login GUIs, and almost
+    # never works in a disposable Sandbox. An explicit Source (incl. 'msstore') always wins.
+    $effectiveSource = $Source
+    if (-not $effectiveSource -and $PreferWingetSource -and (@("search", "show", "install", "upgrade") -contains $Action)) {
+        $effectiveSource = "winget"
+    }
+    if ($effectiveSource) { $wingetArgs += @("--source", $effectiveSource) }
+
     if ($DisableInteractivity) { $wingetArgs += "--disable-interactivity" }
 
     if ($AcceptAgreements) {
-        if (@("search", "show", "install", "upgrade") -contains $Action) { $wingetArgs += "--accept-source-agreements" }
+        if (@("search", "show", "install", "upgrade", "list") -contains $Action) { $wingetArgs += "--accept-source-agreements" }
         if (@("install", "upgrade") -contains $Action) { $wingetArgs += "--accept-package-agreements" }
     }
-    if ($Action -eq "install" -and $Silent) { $wingetArgs += "--silent" }
-    if ($Action -eq "install" -and $Scope) { $wingetArgs += @("--scope", $Scope) }
+    if (@("install", "upgrade") -contains $Action -and $Silent) { $wingetArgs += "--silent" }
+    if (@("install", "upgrade") -contains $Action -and $Scope) { $wingetArgs += @("--scope", $Scope) }
     if ($CustomArgs) { $wingetArgs += @($CustomArgs) }
 
     $process = Invoke-CapturedProcess -FilePath $status.path -Arguments $wingetArgs -TimeoutMs $TimeoutMs
+    $exit = Get-WinGetExitInfo -ExitCode $process.exitCode -TimedOut $process.timedOut
+    # 'noop' (already installed / nothing to upgrade) is a clean result, not a failure.
+    $succeeded = (-not $process.timedOut) -and ($exit.outcome -eq "success" -or $exit.outcome -eq "noop")
     return [ordered]@{
         action = $Action
         packageId = $PackageId
         query = $Query
+        source = $effectiveSource
         winget = $status
         bootstrap = $bootstrap
-        succeeded = (-not $process.timedOut -and $process.exitCode -eq 0)
+        succeeded = $succeeded
+        outcome = $exit.outcome
+        exit = $exit
+        message = $exit.message
+        output = (Clear-WinGetNoise (($process.stdout, $process.stderr) -join "`n"))
         process = $process
     }
 }
@@ -2763,10 +2869,11 @@ function Invoke-AgentCommand {
             $silent = [bool](Get-ArgValue $args "silent" $true)
             $acceptAgreements = [bool](Get-ArgValue $args "acceptAgreements" $true)
             $disableInteractivity = [bool](Get-ArgValue $args "disableInteractivity" $true)
+            $preferWingetSource = [bool](Get-ArgValue $args "preferWingetSource" $true)
             $customArgs = @(Get-ArgValue $args "customArgs" @())
-            $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 300000)
+            $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 0)
             $ensureAvailable = [bool](Get-ArgValue $args "ensureAvailable" $true)
-            return @{ data = (Invoke-SandboxWinGet -Action $action -PackageId $packageId -Query $query -Exact $exact -Source $source -Scope $scope -Silent $silent -AcceptAgreements $acceptAgreements -DisableInteractivity $disableInteractivity -CustomArgs $customArgs -TimeoutMs $timeoutMs -EnsureAvailable $ensureAvailable) }
+            return @{ data = (Invoke-SandboxWinGet -Action $action -PackageId $packageId -Query $query -Exact $exact -Source $source -Scope $scope -Silent $silent -AcceptAgreements $acceptAgreements -DisableInteractivity $disableInteractivity -PreferWingetSource $preferWingetSource -CustomArgs $customArgs -TimeoutMs $timeoutMs -EnsureAvailable $ensureAvailable) }
         }
         "intune_prereqs" {
             $toolPath = [string](Get-ArgValue $args "toolPath" "")

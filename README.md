@@ -27,7 +27,7 @@ Sandbox Pilot exposes [Windows Sandbox](https://learn.microsoft.com/en-us/window
 | **Synchronize** | `sandbox_wait_for` — block until a UI element appears/disappears (no guessed sleeps) |
 | **Watch (real-time)** | `sandbox_watch_start` / `sandbox_watch_poll` / `sandbox_wait_for_event` / `sandbox_watch_stop` — a background watcher notices windows opening/closing, foreground changes, and processes starting/exiting the moment they happen; block on an event or drain them between actions |
 | **Bridge files** | `sandbox_bridge_info`, `sandbox_stage_host_path` - discover the active host/guest bridge and copy host files or folders into `C:\SandboxBridge\processed` |
-| **WinGet** | `sandbox_winget_bootstrap`, `sandbox_winget` - install WinGet into a vanilla Sandbox, then search/show/install/upgrade/uninstall/list packages with automation-friendly flags |
+| **WinGet** | `sandbox_winget_bootstrap`, `sandbox_winget` - install WinGet into a vanilla Sandbox, then search/show/install/upgrade/uninstall/list packages. Pins the `winget` source (avoids the GUI-prone `msstore`), runs silent/non-interactive, and returns a decoded `outcome` + exit code instead of raw noise |
 | **Installers** | `sandbox_find_install_candidates`, `sandbox_msi_inspect`, `sandbox_analyze_installers`, `sandbox_test_install_command`, `sandbox_verify_detection_rule` - inspect installer payloads, infer silent commands, verify installs, and prove detection rules in the disposable VM |
 | **Test** | `sandbox_assert` (file/registry/process/service/window/installedProgram/msiProductCode/script pass-fail checks), `sandbox_run_test_plan` - run a declarative step list and emit JUnit XML + a screenshot-embedded Markdown report |
 | **Snapshot / diff** | `sandbox_snapshot`, `sandbox_diff_snapshots` - baseline files/registry/programs/services, then diff before vs after to see exactly what an installer changed (footprint docs + uninstall-residue checks) |
@@ -148,7 +148,14 @@ cd Sandbox-Pilot
 
 ## Installer analysis workflow
 
-Windows Sandbox does not include WinGet or the Microsoft Store. Use `sandbox_winget` with a known package id such as `Microsoft.VisualStudioCode` to bootstrap WinGet if needed and install directly; or call `sandbox_winget_bootstrap` first when you want to separate the bootstrap from the install. The bootstrap uses Microsoft's current `Microsoft.WinGet.Client` / `Repair-WinGetPackageManager` flow for Windows Sandbox. `sandbox_winget` adds agreement and noninteractive flags by default and returns the WinGet stdout/stderr/exit code so failed package installs are still diagnosable.
+Windows Sandbox does not include WinGet or the Microsoft Store. Use `sandbox_winget` with a known package id such as `Microsoft.VisualStudioCode` to bootstrap WinGet if needed and install directly; or call `sandbox_winget_bootstrap` first when you want to separate the bootstrap from the install. The bootstrap uses Microsoft's current `Microsoft.WinGet.Client` / `Repair-WinGetPackageManager -Latest` flow and retries until `winget` actually responds.
+
+`sandbox_winget` is tuned for unattended Sandbox use:
+
+- **Pins the community `winget` source by default** so it never reaches into `msstore`, which needs a signed-in Microsoft account and pops Store/login GUIs that hang an automated run. Set `source: "msstore"` (or `preferWingetSource: false`) only if you really need it.
+- **Silent, non-interactive install/upgrade** (`--silent --disable-interactivity` + agreement flags) so installers do not block on a GUI.
+- **Action-aware timeouts** (10 min for install/upgrade/uninstall, 2 min for search/show/list) and a fixed pipe-buffer deadlock in the capture path that previously surfaced as bogus timeouts on chatty installers.
+- **Interpreted results**: every call returns an `outcome` (`success` / `noop` / `notFound` / `needsInput` / `needsAttention` / `failed` / `timeout`), the decoded WinGet exit code (e.g. `NO_APPLICABLE_INSTALLER`, `PACKAGE_ALREADY_INSTALLED`), a human-readable `message`, and an `output` field with the progress-bar noise stripped — alongside the raw stdout/stderr/exit code. "Already installed" and "nothing to upgrade" report `succeeded: true` (outcome `noop`) instead of looking like a failure.
 
 For software dropped into the Sandbox, start with `sandbox_find_install_candidates` against Downloads, then use `sandbox_analyze_installers` on the highest-ranked folder or payload directory. MSI packages can be inspected directly with `sandbox_msi_inspect`, which returns product metadata, public properties, notable reboot/config flags, and a ready-to-test `msiexec /i ... /qn /norestart /L*v ...` command.
 
