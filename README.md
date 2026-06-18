@@ -25,7 +25,7 @@ Sandbox Pilot exposes [Windows Sandbox](https://learn.microsoft.com/en-us/window
 | **Act (UIA)** | `sandbox_invoke` — actuate a control by name/automationId via Invoke / Toggle / Select / Expand / SetValue (no coordinates, no focus fuss) |
 | **Act (input)** | `sandbox_click`, `sandbox_double_click`, `sandbox_scroll`, `sandbox_drag`, `sandbox_type`, `sandbox_key`, `sandbox_open`, `sandbox_run_ps` (with timeout), `sandbox_center_window`, `sandbox_set_resolution` |
 | **Synchronize** | `sandbox_wait_for` — block until a UI element appears/disappears (no guessed sleeps) |
-| **Watch (real-time)** | `sandbox_watch_start` / `sandbox_watch_poll` / `sandbox_wait_for_event` / `sandbox_watch_stop` — a background watcher notices windows opening/closing, foreground changes, and processes starting/exiting the moment they happen; block on an event or drain them between actions |
+| **Watch (real-time)** | `sandbox_watch_start` / `sandbox_watch_poll` / `sandbox_wait_for_event` / `sandbox_watch_stop` — a background event bus (auto-started at boot) notices windows opening/closing, foreground changes, processes starting/exiting, programs installing/removing, and files appearing/disappearing the moment they happen; block on an event (multi-type + regex) or drain them between actions — the event-driven replacement for blind sleeps |
 | **Bridge files** | `sandbox_bridge_info`, `sandbox_stage_host_path` - discover the active host/guest bridge and copy host files or folders into `C:\SandboxBridge\processed` |
 | **WinGet** | `sandbox_winget_bootstrap`, `sandbox_winget` - install WinGet into a vanilla Sandbox, then search/show/install/upgrade/uninstall/list packages. Pins the `winget` source (avoids the GUI-prone `msstore`), runs silent/non-interactive, and returns a decoded `outcome` + exit code instead of raw noise |
 | **Installers** | `sandbox_find_install_candidates`, `sandbox_msi_inspect`, `sandbox_analyze_installers`, `sandbox_test_install_command`, `sandbox_verify_detection_rule` - inspect installer payloads, infer silent commands, verify installs, and prove detection rules in the disposable VM |
@@ -205,13 +205,16 @@ Generated `.intunewin` files are written to `C:\SandboxBridge\artifacts\intune` 
 
 ## Noticing things in real time
 
-The agent senses on demand (screenshot / UI tree), so on its own it only "sees" the screen when it looks. The **watcher** closes that gap: `sandbox_watch_start` spins up a background loop inside the Sandbox that, every ~300 ms, diffs the top-level windows, the foreground window, and running process names, and records each change as a timestamped event.
+The agent senses on demand (screenshot / UI tree), so on its own it only "sees" the screen when it looks. The **event bus** closes that gap: a background runspace (auto-started at boot, reconfigurable via `sandbox_watch_start`) diffs — every ~300 ms for windows/processes, and on a throttled cadence for the heavier scans — the top-level windows, foreground window, process names, **installed programs** (uninstall registry), and **files in the watched dirs** (Downloads/Desktop), recording each change as a timestamped, cursor-indexed event.
 
-- `sandbox_wait_for_event` **blocks** until a new matching event occurs (filter by `type` and/or a `contains` substring of the value) — the event-driven alternative to guessing sleeps. e.g. wait for a window whose title contains `Installer`, or for `notepad` to exit.
+- `sandbox_wait_for_event` **blocks** until a new matching event occurs — match any of several `types` and/or a `regex`/`contains` over the value — the event-driven replacement for "sleep N seconds and hope." Event types: `windowOpened`/`windowClosed`, `foregroundChanged`, `processStarted`/`processExited`, `programInstalled`/`programRemoved`, `fileCreated`/`fileRemoved`. e.g. wait for `types:['programInstalled'] regex:'Acrobat'` after an install, or `types:['windowOpened'] regex:'(?i)error|user account control'` to catch a blocking dialog.
+  - **Race-free pattern:** to wait for the effect of an action you're about to take, read the cursor from `sandbox_watch_poll` first, trigger the action, then pass that cursor as `sinceId` (otherwise an event that fires before the wait arms is missed).
 - `sandbox_watch_poll` cheaply drains everything new since the last poll (no screenshot).
-- `sandbox_test_install_command` auto-starts the watcher and reports `windowsDuringRun` — so an unexpected modal dialog during a silent install is surfaced automatically, even if it opened and closed before the command returned.
+- `sandbox_test_install_command` reports `windowsDuringRun` — so an unexpected modal dialog during a silent install is surfaced automatically, even if it opened and closed before the command returned.
 
-This doesn't let the model react while idle (MCP is turn-based — nothing interrupts it), but it means the agent never misses an on-screen event and can block until one happens.
+`sandbox_winget` install/upgrade also **stream live progress** via MCP progress notifications while running as a background job, so a long install shows movement instead of a frozen call (and never blocks other Sandbox commands).
+
+This doesn't let the model react while idle (MCP is turn-based — nothing interrupts it mid-thought), but it means the agent never misses a system event and can block until one happens — reacting the instant it does rather than padding a sleep.
 
 ## Guides & documentation
 

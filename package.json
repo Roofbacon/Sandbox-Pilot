@@ -1,6 +1,6 @@
 {
   "name": "sandbox-pilot",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Sandbox Pilot — an MCP server that lets an AI see, click, type, scroll, OCR and build guides inside a disposable Windows Sandbox.",
   "type": "module",
   "bin": {

@@ -18,7 +18,7 @@ const TRANSPORT = process.env.SANDBOX_TRANSPORT === "socket" ? socketBridge : fi
 const sendCommand = TRANSPORT.sendCommand;
 const screenshot = TRANSPORT.screenshot;
 
-const SERVER_VERSION = "0.2.0";
+const SERVER_VERSION = "0.3.0";
 // Bump only on a breaking change to the guest command/result contract. sandbox_health compares
 // this with the value the guest agent reports, so a stale agent surfaces as a clear warning.
 const EXPECTED_GUEST_PROTOCOL = 1;
@@ -452,6 +452,86 @@ server.registerTool(
     text((await sendCommand("winget_bootstrap", { skipIfAvailable, timeoutMs }, timeoutMs + 30000)).data),
 );
 
+// Run a winget install/upgrade as a guest background job and stream progress to the client via
+// MCP progress notifications, so a long install shows live movement instead of a frozen call. The
+// install runs in a separate process, so the agent's command loop stays free to answer status
+// polls. Returns the same structured shape as the synchronous winget path.
+async function runWingetStreaming(args: Record<string, any>, extra: any): Promise<any> {
+  const action = args.action;
+  const overallTimeoutMs = args.timeoutMs && args.timeoutMs > 0 ? args.timeoutMs : 600000;
+  const progressToken = extra?._meta?.progressToken;
+  let progress = 0;
+  const emit = (message: string) => {
+    if (progressToken === undefined || progressToken === null) return;
+    progress += 1;
+    void extra
+      .sendNotification({ method: "notifications/progress", params: { progressToken, progress, message } })
+      .catch(() => {});
+  };
+
+  const target = (args.packageId ?? args.query ?? "").toString();
+  emit(`winget ${action} ${target}: starting…`.trim());
+  // winget_start does any one-time bootstrap inline, then launches the install as a job.
+  const start = (await sendCommand("winget_start", args, Math.max(overallTimeoutMs, 330000) + 30000)).data;
+  const jobId = start.jobId;
+  if (!jobId) throw new Error("winget_start did not return a jobId");
+  if (start.source) emit(`source: ${start.source}`);
+
+  const deadline = Date.now() + overallTimeoutMs;
+  let lastLine = "";
+  let status: any = null;
+  for (;;) {
+    try {
+      status = (await sendCommand("winget_status", { jobId }, 30000)).data;
+      const out = (status.output ?? "").trim();
+      if (out) {
+        const line = out.split("\n").pop()!.trim();
+        if (line && line !== lastLine) {
+          lastLine = line;
+          emit(line);
+        }
+      }
+      if (status.done) break;
+    } catch (e) {
+      // A single poll hiccup must not abort the stream — the install keeps running in its own
+      // process. Keep polling until the install reports done or the overall deadline passes.
+      emit(`(status poll retry: ${(e as Error).message})`);
+    }
+    if (Date.now() >= deadline) {
+      try {
+        await sendCommand("job_cancel", { jobId }, 30000);
+      } catch {
+        /* best effort */
+      }
+      try {
+        status = (await sendCommand("winget_status", { jobId }, 30000)).data;
+      } catch {
+        /* keep whatever last status we had */
+      }
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 800));
+  }
+  if (!status) throw new Error("winget streaming produced no status");
+  emit(status.message ?? `winget ${action} finished (${status.outcome ?? status.status})`);
+
+  return {
+    action,
+    packageId: args.packageId ?? "",
+    query: args.query ?? "",
+    source: start.source,
+    jobId,
+    streamed: progressToken !== undefined && progressToken !== null,
+    succeeded: status.succeeded ?? false,
+    outcome: status.outcome ?? status.status,
+    exit: status.exit ?? null,
+    message: status.message ?? null,
+    output: status.output ?? "",
+    winget: start.winget,
+    bootstrap: start.bootstrap,
+  };
+}
+
 server.registerTool(
   "sandbox_winget",
   {
@@ -464,7 +544,9 @@ server.registerTool(
       "silent install/upgrade. The result includes an interpreted 'outcome' (success | noop | " +
       "notFound | needsInput | needsAttention | failed | timeout), the decoded winget exit code, a " +
       "human 'message', and cleaned 'output' (progress-bar noise stripped). 'noop' (e.g. already " +
-      "installed, nothing to upgrade) reports succeeded=true. To target the Microsoft Store, set " +
+      "installed, nothing to upgrade) reports succeeded=true. install/upgrade run as a background " +
+      "job and stream live progress via MCP progress notifications (so the call is never a frozen " +
+      "wait), without blocking other Sandbox commands. To target the Microsoft Store, set " +
       "source='msstore' explicitly (expect it to fail in a disposable Sandbox).",
     inputSchema: {
       action: z.enum(["search", "show", "install", "upgrade", "uninstall", "list"]).describe("WinGet command to run."),
@@ -493,7 +575,16 @@ server.registerTool(
       ensureAvailable: z.boolean().default(true).describe("Bootstrap WinGet first if winget.exe is not available."),
     },
   },
-  async (args) => text((await sendCommand("winget", args, (args.timeoutMs && args.timeoutMs > 0 ? args.timeoutMs : 600000) + 30000)).data),
+  async (args, extra) => {
+    // install/upgrade can be slow: run them as a streamed background job so the human sees live
+    // progress and the agent's command loop never blocks. Quick actions stay synchronous.
+    if (args.action === "install" || args.action === "upgrade") {
+      return text(await runWingetStreaming(args as Record<string, any>, extra));
+    }
+    return text(
+      (await sendCommand("winget", args, (args.timeoutMs && args.timeoutMs > 0 ? args.timeoutMs : 600000) + 30000)).data,
+    );
+  },
 );
 
 server.registerTool(
@@ -647,14 +738,20 @@ server.registerTool(
     title: "Start the real-time screen watcher",
     description:
       "Start a background watcher inside the Sandbox that continuously (every intervalMs) notices " +
-      "top-level windows opening/closing, the foreground window changing, and processes starting/" +
-      "exiting — without the agent having to take screenshots. Drain events with sandbox_watch_poll " +
-      "or block on one with sandbox_wait_for_event. This is how you catch a dialog (e.g. a modal " +
-      "installer box) the moment it appears. sandbox_test_install_command auto-starts it.",
+      "top-level windows opening/closing, the foreground window changing, processes starting/exiting, " +
+      "programs being installed/removed (uninstall registry), and files appearing/disappearing in the " +
+      "watched dirs — without the agent having to take screenshots. The agent auto-starts this at boot; " +
+      "call this only to reconfigure it. Drain events with sandbox_watch_poll or block on one with " +
+      "sandbox_wait_for_event. This is how you catch a dialog (e.g. a modal installer box) the moment " +
+      "it appears.",
     inputSchema: {
-      intervalMs: z.number().int().positive().default(300).describe("Snapshot/diff cadence in ms (lower = snappier, more CPU)."),
+      intervalMs: z.number().int().positive().default(300).describe("Window/process diff cadence in ms (lower = snappier, more CPU)."),
       watchProcesses: z.boolean().default(true).describe("Emit processStarted/processExited events (by process name)."),
       watchForeground: z.boolean().default(true).describe("Emit foregroundChanged events."),
+      watchPrograms: z.boolean().default(true).describe("Emit programInstalled/programRemoved events (uninstall registry diff)."),
+      watchFiles: z.boolean().default(true).describe("Emit fileCreated/fileRemoved events for the watched dirs."),
+      scanEveryTicks: z.number().int().positive().default(5).describe("Run the heavier program/file scans every Nth interval (throttle)."),
+      watchDirs: z.array(z.string()).optional().describe("Dirs to watch for file events. Defaults to the user's Downloads, Desktop, and Public Desktop."),
     },
   },
   async (args) => {
@@ -680,9 +777,10 @@ server.registerTool(
     title: "Drain new watcher events",
     description:
       "Return the watcher events that occurred since the last poll (windowOpened / windowClosed / " +
-      "foregroundChanged / processStarted / processExited, each with a timestamp). Cheap — no " +
-      "screenshot. Auto-starts the watcher if it isn't running (then events accrue from that point). " +
-      "Use between actions to learn what changed; use sandbox_wait_for_event to block for one.",
+      "foregroundChanged / processStarted / processExited / programInstalled / programRemoved / " +
+      "fileCreated / fileRemoved, each with a timestamp). Cheap — no screenshot. Auto-starts the " +
+      "watcher if it isn't running. Use between actions to learn what changed; use " +
+      "sandbox_wait_for_event to block for one.",
     inputSchema: {
       max: z.number().int().positive().default(500).describe("Max events to return."),
     },
@@ -697,25 +795,56 @@ server.registerTool(
 server.registerTool(
   "sandbox_wait_for_event",
   {
-    title: "Block until something happens on screen",
+    title: "Block until something happens across the system",
     description:
       "Block until the watcher reports a NEW event (from the moment of this call) matching the filter, " +
-      "or until timeout — then return it along with everything else seen meanwhile. The event-driven " +
-      "way to synchronize: instead of guessing sleeps and re-screenshotting, wait for e.g. a window " +
-      "whose title contains 'Installer', or any foreground change. Filter by type and/or a substring " +
-      "of the event value. satisfied=false means it timed out.",
+      "or until timeout — then return it plus everything else seen meanwhile. THIS IS HOW YOU REPLACE " +
+      "'sleep N seconds and hope': name what you're waiting for and get control back the instant it " +
+      "happens. Match any of several event types and/or a regex (or substring) over the event value. " +
+      "Examples: wait for types=['programInstalled'] regex='Acrobat' after an install; " +
+      "types=['windowOpened'] regex='(?i)error|user account control' to catch a blocking dialog; " +
+      "types=['processExited'] contains='setup' for an installer to finish. satisfied=false means it " +
+      "timed out (check the returned events to see what did happen).",
     inputSchema: {
-      timeoutMs: z.number().int().positive().default(15000).describe("Max time to block, in ms."),
+      timeoutMs: z.number().int().positive().default(30000).describe("Max time to block, in ms."),
       pollMs: z.number().int().positive().default(200).describe("Internal poll cadence in ms."),
-      type: z
-        .enum(["windowOpened", "windowClosed", "foregroundChanged", "processStarted", "processExited"])
+      types: z
+        .array(
+          z.enum([
+            "windowOpened",
+            "windowClosed",
+            "foregroundChanged",
+            "processStarted",
+            "processExited",
+            "programInstalled",
+            "programRemoved",
+            "fileCreated",
+            "fileRemoved",
+          ]),
+        )
         .optional()
-        .describe("Only match this event type (omit to match any)."),
-      contains: z.string().optional().describe("Only match when the event value contains this substring (case-insensitive), e.g. a window title."),
+        .describe("Match any of these event types (omit to match any type)."),
+      type: z.string().optional().describe("Convenience: a single event type (merged into types)."),
+      contains: z.string().optional().describe("Match when the event value contains this substring (case-insensitive)."),
+      regex: z.string().optional().describe("Match when the event value matches this regex (case-insensitive). Takes precedence over contains for fine filters."),
+      sinceId: z
+        .number()
+        .int()
+        .optional()
+        .describe(
+          "Only consider events after this cursor id. Omit to match from now. To wait race-free for the effect of an action you're about to take: read the cursor from sandbox_watch_poll FIRST, trigger the action, then pass that cursor here.",
+        ),
     },
   },
   async (args) => {
-    const r = (await sendCommand("watch_wait", { ...args, sinceId: -1 }, (args.timeoutMs ?? 15000) + 5000)).data;
+    const types = [...(args.types ?? []), ...(args.type ? [args.type] : [])];
+    const r = (
+      await sendCommand(
+        "wait_for_event",
+        { timeoutMs: args.timeoutMs, pollMs: args.pollMs, types, contains: args.contains, regex: args.regex, sinceId: args.sinceId ?? -1 },
+        (args.timeoutMs ?? 30000) + 5000,
+      )
+    ).data;
     if (typeof r?.cursor === "number") lastWatchCursor = r.cursor;
     return text(r);
   },

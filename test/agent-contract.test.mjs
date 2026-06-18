@@ -68,3 +68,30 @@ test("sandbox_winget pins the winget source by default and interprets exit codes
   // deadlock that surfaces as bogus winget timeouts.
   assert.match(guestSrc, /ReadToEndAsync\(\)/);
 });
+
+test("winget install streams via a background job (Phase 0/1)", () => {
+  // install/upgrade run as a guest job so the command loop stays free, and the server streams
+  // progress notifications while polling winget_status.
+  const cmds = advertisedCommands();
+  assert.ok(cmds.includes("winget_start"));
+  assert.ok(cmds.includes("winget_status"));
+  assert.match(guestSrc, /function Start-SandboxWinGetJob/);
+  assert.match(guestSrc, /function Resolve-WinGetInvocation/);
+  assert.match(serverSrc, /runWingetStreaming/);
+  assert.match(serverSrc, /notifications\/progress/);
+});
+
+test("the event bus auto-starts and emits program/file events with a generalized wait (Phase 2)", () => {
+  assert.ok(advertisedCommands().includes("wait_for_event"));
+  assert.match(guestSrc, /function Wait-SandboxEvent/);
+  assert.match(guestSrc, /"programInstalled"/);
+  assert.match(guestSrc, /"fileCreated"/);
+  // Watcher is brought up at boot so events accrue from t0.
+  assert.match(guestSrc, /Start-SandboxWatcher\b[\s\S]{0,40}Event watcher auto-started/);
+  assert.match(serverSrc, /"sandbox_wait_for_event"/);
+});
+
+test("server and guest version are bumped to 0.3.0 so a stale agent is visible", () => {
+  assert.match(serverSrc, /SERVER_VERSION\s*=\s*"0\.3\.0"/);
+  assert.match(guestSrc, /\$AgentVersion\s*=\s*"0\.3\.0"/);
+});

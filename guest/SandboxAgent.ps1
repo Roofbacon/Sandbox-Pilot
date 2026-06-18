@@ -14,7 +14,7 @@ $ErrorActionPreference = "Stop"
 # Agent version + wire protocol. The protocol is bumped only on a breaking change to the
 # command/result contract; the MCP server compares it during sandbox_health to catch a stale
 # agent (guest/server drift) loudly instead of failing on an unknown command later.
-$AgentVersion = "0.2.0"
+$AgentVersion = "0.3.0"
 $AgentProtocol = 1
 
 # Command types this agent advertises (see Invoke-AgentCommand). Get-AgentCapabilities returns
@@ -25,9 +25,9 @@ $AgentCommands = @(
     "run_ps", "center_window",
     "installer_candidates", "msi_inspect", "installer_analyze", "installer_test",
     "detection_verify", "assert", "snapshot_capture", "event_logs",
-    "watch_start", "watch_stop", "watch_poll", "watch_wait",
+    "watch_start", "watch_stop", "watch_poll", "watch_wait", "wait_for_event",
     "job_start_ps", "job_status", "job_cancel",
-    "winget_bootstrap", "winget",
+    "winget_bootstrap", "winget", "winget_start", "winget_status",
     "intune_prereqs", "intune_package",
     "processes", "screen_info", "stop_agent"
 )
@@ -662,7 +662,38 @@ public static class SbxWinEnum {
         while ($Events.Count -gt $cap) { try { $Events.RemoveAt(0) } catch { break } }
     }
 
-    $prevTitles = @{}; $prevFg = $null; $prevProcs = @{}; $seeded = $false
+    # Read the set of installed-program display names from the uninstall registry keys. Inlined
+    # because this runspace is isolated and cannot see the agent's Get-InstalledPrograms.
+    $readPrograms = {
+        $set = @{}
+        $roots = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+        )
+        foreach ($root in $roots) {
+            if (-not (Test-Path -LiteralPath $root)) { continue }
+            foreach ($key in (Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
+                $name = $null
+                try { $name = (Get-ItemProperty -LiteralPath $key.PSPath -Name DisplayName -ErrorAction SilentlyContinue).DisplayName } catch { }
+                if ($name) { $set["$name"] = $true }
+            }
+        }
+        return $set
+    }
+    # Read the set of files (full paths) sitting directly in the watched directories.
+    $readFiles = {
+        param($Dirs)
+        $set = @{}
+        foreach ($dir in $Dirs) {
+            if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { continue }
+            foreach ($f in (Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue)) { $set[$f.FullName] = $true }
+        }
+        return $set
+    }
+
+    $prevTitles = @{}; $prevFg = $null; $prevProcs = @{}; $prevPrograms = @{}; $prevFiles = @{}
+    $seeded = $false; $progSeeded = $false; $fileSeeded = $false; $tick = 0
     while ($Control['Running']) {
         try {
             $cur = @{}; foreach ($t in [SbxWinEnum]::Titles()) { $cur[$t] = $true }
@@ -686,6 +717,28 @@ public static class SbxWinEnum {
                 $prevProcs = $names
             }
             $seeded = $true
+
+            # Throttle the heavier registry/file scans: run them every Nth tick, not every interval.
+            $scanEvery = [int]$Control['ScanEveryTicks']; if ($scanEvery -lt 1) { $scanEvery = 5 }
+            if (($tick % $scanEvery) -eq 0) {
+                if ($Control['WatchPrograms']) {
+                    $progs = & $readPrograms
+                    if ($progSeeded) {
+                        foreach ($n in $progs.Keys) { if (-not $prevPrograms.ContainsKey($n)) { & $emit "programInstalled" $n } }
+                        foreach ($n in $prevPrograms.Keys) { if (-not $progs.ContainsKey($n)) { & $emit "programRemoved" $n } }
+                    }
+                    $prevPrograms = $progs; $progSeeded = $true
+                }
+                if ($Control['WatchFiles']) {
+                    $files = & $readFiles ($Control['WatchDirs'])
+                    if ($fileSeeded) {
+                        foreach ($f in $files.Keys) { if (-not $prevFiles.ContainsKey($f)) { & $emit "fileCreated" $f } }
+                        foreach ($f in $prevFiles.Keys) { if (-not $files.ContainsKey($f)) { & $emit "fileRemoved" $f } }
+                    }
+                    $prevFiles = $files; $fileSeeded = $true
+                }
+            }
+            $tick++
         }
         catch { $Control['Error'] = $_.Exception.Message }
         Start-Sleep -Milliseconds ([int]$Control['IntervalMs'])
@@ -702,17 +755,35 @@ function Get-WatcherStatus {
 }
 
 function Start-SandboxWatcher {
-    param([int]$IntervalMs = 300, [bool]$WatchProcesses = $true, [bool]$WatchForeground = $true)
+    param(
+        [int]$IntervalMs = 300,
+        [bool]$WatchProcesses = $true,
+        [bool]$WatchForeground = $true,
+        [bool]$WatchPrograms = $true,
+        [bool]$WatchFiles = $true,
+        [int]$ScanEveryTicks = 5,
+        [string[]]$WatchDirs = @()
+    )
 
     if ($script:WatchControl -and $script:WatchControl['Running']) {
         $status = Get-WatcherStatus
         $status['alreadyRunning'] = $true
         return $status
     }
+    # Default watched dirs: where installers and downloads land for the Sandbox user.
+    if (-not $WatchDirs -or $WatchDirs.Count -eq 0) {
+        $WatchDirs = @(
+            (Join-Path $env:USERPROFILE "Downloads"),
+            (Join-Path $env:USERPROFILE "Desktop"),
+            "C:\Users\Public\Desktop"
+        )
+    }
     $script:WatchEvents = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
     $script:WatchControl = [hashtable]::Synchronized(@{
             Running = $true; IntervalMs = $IntervalMs; WatchProcesses = $WatchProcesses
-            WatchForeground = $WatchForeground; MaxId = 0; Error = $null; StartedAt = (Get-Date).ToString("o")
+            WatchForeground = $WatchForeground; WatchPrograms = $WatchPrograms; WatchFiles = $WatchFiles
+            ScanEveryTicks = $ScanEveryTicks; WatchDirs = @($WatchDirs)
+            MaxId = 0; Error = $null; StartedAt = (Get-Date).ToString("o")
         })
     $rs = [runspacefactory]::CreateRunspace()
     $rs.ApartmentState = "MTA"
@@ -763,16 +834,37 @@ function Get-WatcherEventsSince {
 
 function Wait-SandboxWatcherEvent {
     param([int]$TimeoutMs = 15000, [int]$PollMs = 200, [string]$Type = "", [string]$Contains = "", [int]$SinceId = -1)
+    # Back-compat shim for the original watch_wait (single type + substring).
+    return (Wait-SandboxEvent -TimeoutMs $TimeoutMs -PollMs $PollMs -Types @($Type | Where-Object { $_ }) -Contains $Contains -SinceId $SinceId)
+}
+
+function Wait-SandboxEvent {
+    # Block until a system event matches the predicate, or a timeout elapses. This is what replaces
+    # "sleep N seconds and hope": the agent names what it is waiting for (a process exiting, a
+    # program installing, a dialog appearing, a file landing) and gets control back the instant it
+    # happens. Match on any of several Types and/or a regex (or plain substring) over the value.
+    param(
+        [int]$TimeoutMs = 30000,
+        [int]$PollMs = 200,
+        [string[]]$Types = @(),
+        [string]$Contains = "",
+        [string]$Regex = "",
+        [int]$SinceId = -1
+    )
 
     [void](Confirm-SandboxWatcher)
     if ($SinceId -lt 0) { $SinceId = [int]$script:WatchControl['MaxId'] }   # baseline: only future events count
+    $types = @($Types | Where-Object { $_ })
+    $rx = $null
+    if ($Regex) { $rx = [regex]::new($Regex, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase) }
     $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
     while ($true) {
         $all = @($script:WatchEvents.ToArray())
         $new = @($all | Where-Object { [int]$_.id -gt $SinceId })
         $match = $new | Where-Object {
-            ((-not $Type) -or ($_.type -eq $Type)) -and
-            ((-not $Contains) -or (([string]$_.value).IndexOf($Contains, [System.StringComparison]::OrdinalIgnoreCase) -ge 0))
+            ((($types.Count) -eq 0) -or ($types -contains $_.type)) -and
+            ((-not $Contains) -or (([string]$_.value).IndexOf($Contains, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)) -and
+            ((-not $rx) -or ($rx.IsMatch([string]$_.value)))
         } | Select-Object -First 1
         $cursor = if ($all.Count) { [int]($all[$all.Count - 1].id) } else { $SinceId }
         if ($match) { return [ordered]@{ satisfied = $true; timedOut = $false; matched = $match; events = @($new); cursor = $cursor } }
@@ -1115,7 +1207,11 @@ function Invoke-WinGetBootstrap {
     }
 }
 
-function Invoke-SandboxWinGet {
+function Resolve-WinGetInvocation {
+    # Shared front-half of every winget operation: validate, default the timeout, ensure winget is
+    # available (bootstrapping if asked), and build the argument list + effective source. Used by
+    # both the synchronous Invoke-SandboxWinGet and the streaming Start-SandboxWinGetJob so they
+    # never drift apart.
     param(
         [string]$Action,
         [string]$PackageId = "",
@@ -1185,7 +1281,38 @@ function Invoke-SandboxWinGet {
     if (@("install", "upgrade") -contains $Action -and $Scope) { $wingetArgs += @("--scope", $Scope) }
     if ($CustomArgs) { $wingetArgs += @($CustomArgs) }
 
-    $process = Invoke-CapturedProcess -FilePath $status.path -Arguments $wingetArgs -TimeoutMs $TimeoutMs
+    return [ordered]@{
+        action = $Action
+        packageId = $PackageId
+        query = $Query
+        source = $effectiveSource
+        arguments = @($wingetArgs)
+        timeoutMs = $TimeoutMs
+        winget = $status
+        bootstrap = $bootstrap
+    }
+}
+
+function Invoke-SandboxWinGet {
+    param(
+        [string]$Action,
+        [string]$PackageId = "",
+        [string]$Query = "",
+        [bool]$Exact = $false,
+        [string]$Source = "",
+        [string]$Scope = "",
+        [bool]$Silent = $true,
+        [bool]$AcceptAgreements = $true,
+        [bool]$DisableInteractivity = $true,
+        [bool]$PreferWingetSource = $true,
+        [string[]]$CustomArgs = @(),
+        [int]$TimeoutMs = 0,
+        [bool]$EnsureAvailable = $true
+    )
+
+    $plan = Resolve-WinGetInvocation -Action $Action -PackageId $PackageId -Query $Query -Exact $Exact -Source $Source -Scope $Scope -Silent $Silent -AcceptAgreements $AcceptAgreements -DisableInteractivity $DisableInteractivity -PreferWingetSource $PreferWingetSource -CustomArgs $CustomArgs -TimeoutMs $TimeoutMs -EnsureAvailable $EnsureAvailable
+
+    $process = Invoke-CapturedProcess -FilePath $plan.winget.path -Arguments $plan.arguments -TimeoutMs $plan.timeoutMs
     $exit = Get-WinGetExitInfo -ExitCode $process.exitCode -TimedOut $process.timedOut
     # 'noop' (already installed / nothing to upgrade) is a clean result, not a failure.
     $succeeded = (-not $process.timedOut) -and ($exit.outcome -eq "success" -or $exit.outcome -eq "noop")
@@ -1193,9 +1320,9 @@ function Invoke-SandboxWinGet {
         action = $Action
         packageId = $PackageId
         query = $Query
-        source = $effectiveSource
-        winget = $status
-        bootstrap = $bootstrap
+        source = $plan.source
+        winget = $plan.winget
+        bootstrap = $plan.bootstrap
         succeeded = $succeeded
         outcome = $exit.outcome
         exit = $exit
@@ -1203,6 +1330,108 @@ function Invoke-SandboxWinGet {
         output = (Clear-WinGetNoise (($process.stdout, $process.stderr) -join "`n"))
         process = $process
     }
+}
+
+function ConvertTo-PSArrayLiteral {
+    # Render a string array as a PowerShell single-quoted array literal: @('a','b'). Safe to embed
+    # in a generated command because every value is single-quoted with internal quotes doubled.
+    param([string[]]$Items)
+    if (-not $Items -or $Items.Count -eq 0) { return "@()" }
+    $quoted = foreach ($i in $Items) { "'" + ([string]$i -replace "'", "''") + "'" }
+    return "@(" + ($quoted -join ", ") + ")"
+}
+
+function Start-SandboxWinGetJob {
+    # Launch a winget operation as a background job (separate powershell.exe process) so the agent's
+    # command loop stays responsive and the host can stream progress by polling winget_status. The
+    # heavy/blocking part (a one-time bootstrap) still runs inline here, but the install itself does
+    # not. Reuses the generic job runner so status/tail/cancel all work unchanged.
+    param(
+        [string]$Action,
+        [string]$PackageId = "",
+        [string]$Query = "",
+        [bool]$Exact = $false,
+        [string]$Source = "",
+        [string]$Scope = "",
+        [bool]$Silent = $true,
+        [bool]$AcceptAgreements = $true,
+        [bool]$DisableInteractivity = $true,
+        [bool]$PreferWingetSource = $true,
+        [string[]]$CustomArgs = @(),
+        [int]$TimeoutMs = 0,
+        [bool]$EnsureAvailable = $true
+    )
+
+    $plan = Resolve-WinGetInvocation -Action $Action -PackageId $PackageId -Query $Query -Exact $Exact -Source $Source -Scope $Scope -Silent $Silent -AcceptAgreements $AcceptAgreements -DisableInteractivity $DisableInteractivity -PreferWingetSource $PreferWingetSource -CustomArgs $CustomArgs -TimeoutMs $TimeoutMs -EnsureAvailable $EnsureAvailable
+
+    # The job runner base64-encodes and runs this command string; winget's $LASTEXITCODE flows
+    # into the job's result.json, so the exit code is preserved.
+    $command = "`$a = " + (ConvertTo-PSArrayLiteral -Items ([string[]]$plan.arguments)) + "; & '" + ($plan.winget.path -replace "'", "''") + "' @a"
+
+    $job = Start-SandboxPowerShellJob -Command $command -TimeoutMs $plan.timeoutMs
+    return [ordered]@{
+        jobId = $job.jobId
+        action = $Action
+        packageId = $PackageId
+        query = $Query
+        source = $plan.source
+        winget = $plan.winget
+        bootstrap = $plan.bootstrap
+        arguments = $plan.arguments
+        timeoutMs = $plan.timeoutMs
+        status = $job.status
+    }
+}
+
+function Get-SandboxWinGetJobStatus {
+    # Job status enriched with WinGet's decoded outcome once the install completes, plus the
+    # progress-cleaned output. While the job runs, winget holds stdout.log open, so we rely on the
+    # shared-read tail Get-SandboxJobStatus already captured; only once the job is done do we read
+    # the whole file (with FileShare.ReadWrite, so a not-quite-released handle can never block us -
+    # an exclusive ReadAllText here was deadlocking the command loop the instant winget exited).
+    param([string]$JobId, [int]$TailLines = 200)
+
+    $job = Get-SandboxJobStatus -JobId $JobId -TailLines $TailLines
+    $done = @("completed", "timedOut", "cancelled", "unknown") -contains $job.status
+
+    $rawOut = ""
+    if ($done) {
+        try {
+            $stdoutPath = $job.paths.stdout
+            if ($stdoutPath -and (Test-Path -LiteralPath $stdoutPath)) {
+                $fs = [System.IO.FileStream]::new($stdoutPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                try { $sr = [System.IO.StreamReader]::new($fs); $rawOut = $sr.ReadToEnd() } finally { if ($sr) { $sr.Dispose() }; $fs.Dispose() }
+            }
+        }
+        catch { $rawOut = (@($job.stdoutTail) -join "`n") }
+    }
+    else {
+        $rawOut = (@($job.stdoutTail) -join "`n")
+    }
+    $cleaned = Clear-WinGetNoise $rawOut
+
+    $result = [ordered]@{
+        jobId = $JobId
+        status = $job.status
+        done = $done
+        running = (-not $done)
+        exitCode = $job.exitCode
+        output = $cleaned
+        stdoutTail = $job.stdoutTail
+        stderrTail = $job.stderrTail
+        startedAt = $job.startedAt
+        finishedAt = $job.finishedAt
+        error = $job.error
+    }
+    if ($done) {
+        $timedOut = [bool]$job.timedOut
+        $exit = Get-WinGetExitInfo -ExitCode $job.exitCode -TimedOut $timedOut
+        $result['outcome'] = $exit.outcome
+        $result['exit'] = $exit
+        $result['message'] = $exit.message
+        $result['succeeded'] = ((-not $timedOut) -and ($exit.outcome -eq "success" -or $exit.outcome -eq "noop"))
+    }
+    return $result
 }
 
 function Write-Utf8JsonFile {
@@ -1238,9 +1467,21 @@ function Stop-ProcessTree {
 }
 
 function Get-TextTail {
+    # Read the last N lines WITHOUT Get-Content -Tail: on Windows PowerShell that call blocks on a
+    # file another process holds open and is actively writing (exactly a running job's stdout.log),
+    # which deadlocks the command loop. A FileShare.ReadWrite FileStream opens or fails instantly
+    # and never blocks, so polling a live job is safe.
     param([string]$Path, [int]$TailLines = 80)
     if (-not (Test-Path -LiteralPath $Path)) { return @() }
-    return @((Get-Content -LiteralPath $Path -Tail $TailLines -ErrorAction SilentlyContinue))
+    try {
+        $fs = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $text = ""
+        try { $sr = [System.IO.StreamReader]::new($fs); $text = $sr.ReadToEnd() } finally { if ($sr) { $sr.Dispose() }; $fs.Dispose() }
+        $lines = $text -split "`r?`n"
+        if ($lines.Count -gt $TailLines) { $lines = $lines[($lines.Count - $TailLines)..($lines.Count - 1)] }
+        return @($lines)
+    }
+    catch { return @() }
 }
 
 function Start-SandboxPowerShellJob {
@@ -2808,7 +3049,11 @@ function Invoke-AgentCommand {
             $intervalMs = [int](Get-ArgValue $args "intervalMs" 300)
             $watchProcesses = [bool](Get-ArgValue $args "watchProcesses" $true)
             $watchForeground = [bool](Get-ArgValue $args "watchForeground" $true)
-            return @{ data = (Start-SandboxWatcher -IntervalMs $intervalMs -WatchProcesses $watchProcesses -WatchForeground $watchForeground) }
+            $watchPrograms = [bool](Get-ArgValue $args "watchPrograms" $true)
+            $watchFiles = [bool](Get-ArgValue $args "watchFiles" $true)
+            $scanEveryTicks = [int](Get-ArgValue $args "scanEveryTicks" 5)
+            $watchDirs = @(Get-ArgValue $args "watchDirs" @())
+            return @{ data = (Start-SandboxWatcher -IntervalMs $intervalMs -WatchProcesses $watchProcesses -WatchForeground $watchForeground -WatchPrograms $watchPrograms -WatchFiles $watchFiles -ScanEveryTicks $scanEveryTicks -WatchDirs $watchDirs) }
         }
         "watch_stop" {
             return @{ data = (Stop-SandboxWatcher) }
@@ -2825,6 +3070,15 @@ function Invoke-AgentCommand {
             $contains = [string](Get-ArgValue $args "contains" "")
             $sinceId = [int](Get-ArgValue $args "sinceId" -1)
             return @{ data = (Wait-SandboxWatcherEvent -TimeoutMs $timeoutMs -PollMs $pollMs -Type $type -Contains $contains -SinceId $sinceId) }
+        }
+        "wait_for_event" {
+            $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 30000)
+            $pollMs = [int](Get-ArgValue $args "pollMs" 200)
+            $types = @(Get-ArgValue $args "types" @())
+            $contains = [string](Get-ArgValue $args "contains" "")
+            $regex = [string](Get-ArgValue $args "regex" "")
+            $sinceId = [int](Get-ArgValue $args "sinceId" -1)
+            return @{ data = (Wait-SandboxEvent -TimeoutMs $timeoutMs -PollMs $pollMs -Types $types -Contains $contains -Regex $regex -SinceId $sinceId) }
         }
         "snapshot_capture" {
             $label = [string](Get-ArgValue $args "label" "")
@@ -2874,6 +3128,28 @@ function Invoke-AgentCommand {
             $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 0)
             $ensureAvailable = [bool](Get-ArgValue $args "ensureAvailable" $true)
             return @{ data = (Invoke-SandboxWinGet -Action $action -PackageId $packageId -Query $query -Exact $exact -Source $source -Scope $scope -Silent $silent -AcceptAgreements $acceptAgreements -DisableInteractivity $disableInteractivity -PreferWingetSource $preferWingetSource -CustomArgs $customArgs -TimeoutMs $timeoutMs -EnsureAvailable $ensureAvailable) }
+        }
+        "winget_start" {
+            $action = [string](Get-ArgValue $args "action" "")
+            $packageId = [string](Get-ArgValue $args "packageId" "")
+            $query = [string](Get-ArgValue $args "query" "")
+            $exactValue = Get-ArgValue $args "exact" $null
+            $exact = $(if ($null -eq $exactValue) { [bool]$packageId } else { [bool]$exactValue })
+            $source = [string](Get-ArgValue $args "source" "")
+            $scope = [string](Get-ArgValue $args "scope" "")
+            $silent = [bool](Get-ArgValue $args "silent" $true)
+            $acceptAgreements = [bool](Get-ArgValue $args "acceptAgreements" $true)
+            $disableInteractivity = [bool](Get-ArgValue $args "disableInteractivity" $true)
+            $preferWingetSource = [bool](Get-ArgValue $args "preferWingetSource" $true)
+            $customArgs = @(Get-ArgValue $args "customArgs" @())
+            $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 0)
+            $ensureAvailable = [bool](Get-ArgValue $args "ensureAvailable" $true)
+            return @{ data = (Start-SandboxWinGetJob -Action $action -PackageId $packageId -Query $query -Exact $exact -Source $source -Scope $scope -Silent $silent -AcceptAgreements $acceptAgreements -DisableInteractivity $disableInteractivity -PreferWingetSource $preferWingetSource -CustomArgs $customArgs -TimeoutMs $timeoutMs -EnsureAvailable $ensureAvailable) }
+        }
+        "winget_status" {
+            $jobId = [string](Get-ArgValue $args "jobId" "")
+            $tailLines = [int](Get-ArgValue $args "tailLines" 60)
+            return @{ data = (Get-SandboxWinGetJobStatus -JobId $jobId -TailLines $tailLines) }
         }
         "intune_prereqs" {
             $toolPath = [string](Get-ArgValue $args "toolPath" "")
@@ -3348,6 +3624,11 @@ function Start-SocketAgent {
 if ($NoStart) { return }
 
 Write-AgentLog "Sandbox agent started from $BridgeRoot"
+
+# Bring the system event bus up at boot so changes (windows, processes, installed programs, files)
+# are captured from t0 - the agent can then answer wait_for_event/watch_poll without a cold start.
+try { [void](Start-SandboxWatcher); Write-AgentLog "Event watcher auto-started" }
+catch { Write-AgentLog "Event watcher auto-start failed: $($_.Exception.Message)" }
 
 if ($SocketPort -gt 0) {
     Start-SocketAgent -Port $SocketPort
