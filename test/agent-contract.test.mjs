@@ -11,6 +11,7 @@ import * as path from "node:path";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const guestSrc = await fsp.readFile(path.join(here, "..", "guest", "SandboxAgent.ps1"), "utf8");
 const serverSrc = await fsp.readFile(path.join(here, "..", "src", "index.ts"), "utf8");
+const wingetBootstrapSrc = await fsp.readFile(path.join(here, "..", "bridge", "BootstrapWinget.ps1"), "utf8");
 
 function advertisedCommands() {
   const block = guestSrc.match(/\$AgentCommands\s*=\s*@\(([\s\S]*?)\)/);
@@ -45,4 +46,13 @@ test("the health command advertises version, protocol, and the command list", ()
   assert.match(guestSrc, /version\s*=\s*\$AgentVersion/);
   assert.match(guestSrc, /protocol\s*=\s*\$AgentProtocol/);
   assert.match(guestSrc, /commands\s*=\s*@\(\$AgentCommands\)/);
+});
+
+test("WinGet tools are registered and use the supported Sandbox bootstrap path", () => {
+  assert.match(serverSrc, /"sandbox_winget_bootstrap"/);
+  assert.match(serverSrc, /"sandbox_winget"/);
+  assert.ok(advertisedCommands().includes("winget_bootstrap"));
+  assert.ok(advertisedCommands().includes("winget"));
+  assert.match(wingetBootstrapSrc, /Install-Module\s+-Name\s+Microsoft\.WinGet\.Client/);
+  assert.match(wingetBootstrapSrc, /Repair-WinGetPackageManager\s+-AllUsers/);
 });

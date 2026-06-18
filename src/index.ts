@@ -436,6 +436,52 @@ server.registerTool(
 );
 
 server.registerTool(
+  "sandbox_winget_bootstrap",
+  {
+    title: "Install WinGet in the Sandbox",
+    description:
+      "Bootstrap WinGet in a vanilla Windows Sandbox using Microsoft's Microsoft.WinGet.Client " +
+      "PowerShell module and Repair-WinGetPackageManager flow. Use this when WinGet is missing; " +
+      "sandbox_winget can also run it automatically with ensureAvailable=true.",
+    inputSchema: {
+      skipIfAvailable: z.boolean().default(true).describe("Return immediately when winget.exe already works."),
+      timeoutMs: z.number().int().positive().default(300000).describe("Maximum time to wait for the bootstrap."),
+    },
+  },
+  async ({ skipIfAvailable, timeoutMs }) =>
+    text((await sendCommand("winget_bootstrap", { skipIfAvailable, timeoutMs }, timeoutMs + 30000)).data),
+);
+
+server.registerTool(
+  "sandbox_winget",
+  {
+    title: "Run WinGet in the Sandbox",
+    description:
+      "Search, show, install, upgrade, uninstall, or list software with WinGet inside the Sandbox. " +
+      "Defaults are automation-friendly: exact package-id matching when a target is supplied, " +
+      "agreement flags, disabled interactivity, and silent installs.",
+    inputSchema: {
+      action: z.enum(["search", "show", "install", "upgrade", "uninstall", "list"]).describe("WinGet command to run."),
+      packageId: z.string().optional().describe("WinGet package id, passed with --id. Preferred for install/uninstall/upgrade."),
+      query: z.string().optional().describe("Free-text search or package query when packageId is not known."),
+      exact: z
+        .boolean()
+        .optional()
+        .describe("Add --exact. Defaults to true when packageId is supplied, false for free-text query searches."),
+      source: z.string().optional().describe("Optional WinGet source, for example winget."),
+      scope: z.enum(["machine", "user"]).optional().describe("Install scope, only used with action=install."),
+      silent: z.boolean().default(true).describe("Add --silent for installs."),
+      acceptAgreements: z.boolean().default(true).describe("Accept source/package agreements where WinGet supports it."),
+      disableInteractivity: z.boolean().default(true).describe("Add --disable-interactivity."),
+      customArgs: z.array(z.string()).optional().describe("Extra raw WinGet arguments appended last for advanced cases."),
+      timeoutMs: z.number().int().positive().default(300000).describe("Maximum time to wait for the WinGet command."),
+      ensureAvailable: z.boolean().default(true).describe("Bootstrap WinGet first if winget.exe is not available."),
+    },
+  },
+  async (args) => text((await sendCommand("winget", args, (args.timeoutMs ?? 300000) + 30000)).data),
+);
+
+server.registerTool(
   "sandbox_bridge_info",
   {
     title: "Show Sandbox bridge paths",

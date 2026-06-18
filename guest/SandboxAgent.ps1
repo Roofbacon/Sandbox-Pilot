@@ -27,6 +27,7 @@ $AgentCommands = @(
     "detection_verify", "assert", "snapshot_capture", "event_logs",
     "watch_start", "watch_stop", "watch_poll", "watch_wait",
     "job_start_ps", "job_status", "job_cancel",
+    "winget_bootstrap", "winget",
     "intune_prereqs", "intune_package",
     "processes", "screen_info", "stop_agent"
 )
@@ -960,6 +961,141 @@ function Invoke-CapturedProcess {
         exitCode = $exitCode
         stdout = $stdout
         stderr = $stderr
+    }
+}
+
+function Resolve-WinGetPath {
+    $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd -and $cmd.Source) { return [string]$cmd.Source }
+
+    $candidates = @(
+        (Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\winget.exe"),
+        "C:\Users\WDAGUtilityAccount\AppData\Local\Microsoft\WindowsApps\winget.exe"
+    )
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+    }
+    return $null
+}
+
+function Get-WinGetStatus {
+    $path = Resolve-WinGetPath
+    $version = $null
+    $works = $false
+    if ($path) {
+        try {
+            $result = Invoke-CapturedProcess -FilePath $path -Arguments @("--version") -TimeoutMs 30000
+            if (-not $result.timedOut -and $result.exitCode -eq 0) {
+                $version = ($result.stdout + $result.stderr).Trim()
+                $works = $true
+            }
+        }
+        catch { }
+    }
+    return [ordered]@{
+        available = $works
+        path = $path
+        version = $version
+    }
+}
+
+function Invoke-WinGetBootstrap {
+    param(
+        [bool]$SkipIfAvailable = $true,
+        [int]$TimeoutMs = 300000
+    )
+
+    $before = Get-WinGetStatus
+    if ($SkipIfAvailable -and $before.available) {
+        return [ordered]@{
+            skipped = $true
+            succeeded = $true
+            before = $before
+            after = $before
+            process = $null
+            script = $null
+        }
+    }
+
+    $script = Join-Path $BridgeRoot "BootstrapWinget.ps1"
+    if (-not (Test-Path -LiteralPath $script)) { throw "BootstrapWinget.ps1 was not found in the bridge: $script" }
+
+    $process = Invoke-CapturedProcess -FilePath "powershell.exe" -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $script) -TimeoutMs $TimeoutMs
+    $after = Get-WinGetStatus
+    return [ordered]@{
+        skipped = $false
+        succeeded = ($after.available -and -not $process.timedOut -and $process.exitCode -eq 0)
+        before = $before
+        after = $after
+        process = $process
+        script = $script
+    }
+}
+
+function Invoke-SandboxWinGet {
+    param(
+        [string]$Action,
+        [string]$PackageId = "",
+        [string]$Query = "",
+        [bool]$Exact = $false,
+        [string]$Source = "",
+        [string]$Scope = "",
+        [bool]$Silent = $true,
+        [bool]$AcceptAgreements = $true,
+        [bool]$DisableInteractivity = $true,
+        [string[]]$CustomArgs = @(),
+        [int]$TimeoutMs = 300000,
+        [bool]$EnsureAvailable = $true
+    )
+
+    $allowed = @("search", "show", "install", "upgrade", "uninstall", "list")
+    if ($allowed -notcontains $Action) { throw "Unsupported winget action '$Action'. Use one of: $($allowed -join ', ')." }
+
+    $bootstrap = $null
+    $status = Get-WinGetStatus
+    if (-not $status.available -and $EnsureAvailable) {
+        $bootstrap = Invoke-WinGetBootstrap -SkipIfAvailable $true -TimeoutMs $TimeoutMs
+        $status = Get-WinGetStatus
+    }
+    if (-not $status.available) {
+        throw "WinGet is not available in the Sandbox. Run sandbox_winget_bootstrap first, or call sandbox_winget with ensureAvailable=true."
+    }
+
+    $target = ""
+    $wingetArgs = @($Action)
+    if ($PackageId) {
+        $wingetArgs += @("--id", $PackageId)
+        $target = $PackageId
+    }
+    elseif ($Query) {
+        $wingetArgs += $Query
+        $target = $Query
+    }
+    elseif (@("search", "show", "install", "upgrade", "uninstall") -contains $Action) {
+        throw "packageId or query is required for winget $Action."
+    }
+
+    if ($Exact -and $target) { $wingetArgs += "--exact" }
+    if ($Source) { $wingetArgs += @("--source", $Source) }
+    if ($DisableInteractivity) { $wingetArgs += "--disable-interactivity" }
+
+    if ($AcceptAgreements) {
+        if (@("search", "show", "install", "upgrade") -contains $Action) { $wingetArgs += "--accept-source-agreements" }
+        if (@("install", "upgrade") -contains $Action) { $wingetArgs += "--accept-package-agreements" }
+    }
+    if ($Action -eq "install" -and $Silent) { $wingetArgs += "--silent" }
+    if ($Action -eq "install" -and $Scope) { $wingetArgs += @("--scope", $Scope) }
+    if ($CustomArgs) { $wingetArgs += @($CustomArgs) }
+
+    $process = Invoke-CapturedProcess -FilePath $status.path -Arguments $wingetArgs -TimeoutMs $TimeoutMs
+    return [ordered]@{
+        action = $Action
+        packageId = $PackageId
+        query = $Query
+        winget = $status
+        bootstrap = $bootstrap
+        succeeded = (-not $process.timedOut -and $process.exitCode -eq 0)
+        process = $process
     }
 }
 
@@ -2610,6 +2746,27 @@ function Invoke-AgentCommand {
         "job_cancel" {
             $jobId = [string](Get-ArgValue $args "jobId" "")
             return @{ data = (Stop-SandboxJob -JobId $jobId) }
+        }
+        "winget_bootstrap" {
+            $skipIfAvailable = [bool](Get-ArgValue $args "skipIfAvailable" $true)
+            $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 300000)
+            return @{ data = (Invoke-WinGetBootstrap -SkipIfAvailable $skipIfAvailable -TimeoutMs $timeoutMs) }
+        }
+        "winget" {
+            $action = [string](Get-ArgValue $args "action" "")
+            $packageId = [string](Get-ArgValue $args "packageId" "")
+            $query = [string](Get-ArgValue $args "query" "")
+            $exactValue = Get-ArgValue $args "exact" $null
+            $exact = $(if ($null -eq $exactValue) { [bool]$packageId } else { [bool]$exactValue })
+            $source = [string](Get-ArgValue $args "source" "")
+            $scope = [string](Get-ArgValue $args "scope" "")
+            $silent = [bool](Get-ArgValue $args "silent" $true)
+            $acceptAgreements = [bool](Get-ArgValue $args "acceptAgreements" $true)
+            $disableInteractivity = [bool](Get-ArgValue $args "disableInteractivity" $true)
+            $customArgs = @(Get-ArgValue $args "customArgs" @())
+            $timeoutMs = [int](Get-ArgValue $args "timeoutMs" 300000)
+            $ensureAvailable = [bool](Get-ArgValue $args "ensureAvailable" $true)
+            return @{ data = (Invoke-SandboxWinGet -Action $action -PackageId $packageId -Query $query -Exact $exact -Source $source -Scope $scope -Silent $silent -AcceptAgreements $acceptAgreements -DisableInteractivity $disableInteractivity -CustomArgs $customArgs -TimeoutMs $timeoutMs -EnsureAvailable $ensureAvailable) }
         }
         "intune_prereqs" {
             $toolPath = [string](Get-ArgValue $args "toolPath" "")
