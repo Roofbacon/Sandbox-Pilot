@@ -14,7 +14,7 @@ $ErrorActionPreference = "Stop"
 # Agent version + wire protocol. The protocol is bumped only on a breaking change to the
 # command/result contract; the MCP server compares it during sandbox_health to catch a stale
 # agent (guest/server drift) loudly instead of failing on an unknown command later.
-$AgentVersion = "0.4.0"
+$AgentVersion = "0.5.0"
 $AgentProtocol = 1
 
 # Command types this agent advertises (see Invoke-AgentCommand). Get-AgentCapabilities returns
@@ -1274,7 +1274,9 @@ function Resolve-WinGetInvocation {
     if ($DisableInteractivity) { $wingetArgs += "--disable-interactivity" }
 
     if ($AcceptAgreements) {
-        if (@("search", "show", "install", "upgrade", "list") -contains $Action) { $wingetArgs += "--accept-source-agreements" }
+        # Every action that touches a source needs the source agreement accepted - including
+        # uninstall, which otherwise fails with "source agreements were not agreed to".
+        if (@("search", "show", "install", "upgrade", "list", "uninstall") -contains $Action) { $wingetArgs += "--accept-source-agreements" }
         if (@("install", "upgrade") -contains $Action) { $wingetArgs += "--accept-package-agreements" }
     }
     if (@("install", "upgrade") -contains $Action -and $Silent) { $wingetArgs += "--silent" }
@@ -1383,6 +1385,25 @@ function Start-SandboxWinGetJob {
     }
 }
 
+function Get-WinGetProgress {
+    # Pull the latest download fraction (e.g. "12.3 MB / 45.6 MB") out of winget's raw output so the
+    # host can show a real numeric progress bar. Returns $null until a fraction appears.
+    param([string]$RawOutput)
+    if (-not $RawOutput) { return $null }
+    $units = @{ B = 1; KB = 1024; MB = 1048576; GB = 1073741824 }
+    $rx = [regex]::new('(\d+(?:\.\d+)?)\s*(B|KB|MB|GB)\s*/\s*(\d+(?:\.\d+)?)\s*(B|KB|MB|GB)', 'IgnoreCase')
+    $matches = $rx.Matches($RawOutput)
+    if ($matches.Count -eq 0) { return $null }
+    $m = $matches[$matches.Count - 1]   # the most recent fraction winget printed
+    $u1 = $units[$m.Groups[2].Value.ToUpper()]; $u2 = $units[$m.Groups[4].Value.ToUpper()]
+    if (-not $u1 -or -not $u2) { return $null }
+    $down = [double]$m.Groups[1].Value * $u1
+    $total = [double]$m.Groups[3].Value * $u2
+    if ($total -le 0) { return $null }
+    $pct = [math]::Min(100, [math]::Round(($down / $total) * 100))
+    return [ordered]@{ downloadedBytes = [long]$down; totalBytes = [long]$total; percent = [int]$pct }
+}
+
 function Get-SandboxWinGetJobStatus {
     # Job status enriched with WinGet's decoded outcome once the install completes, plus the
     # progress-cleaned output. While the job runs, winget holds stdout.log open, so we rely on the
@@ -1417,6 +1438,7 @@ function Get-SandboxWinGetJobStatus {
         running = (-not $done)
         exitCode = $job.exitCode
         output = $cleaned
+        progress = (Get-WinGetProgress -RawOutput $rawOut)
         stdoutTail = $job.stdoutTail
         stderrTail = $job.stderrTail
         startedAt = $job.startedAt

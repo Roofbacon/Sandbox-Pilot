@@ -18,7 +18,7 @@ const TRANSPORT = process.env.SANDBOX_TRANSPORT === "socket" ? socketBridge : fi
 const sendCommand = TRANSPORT.sendCommand;
 const screenshot = TRANSPORT.screenshot;
 
-const SERVER_VERSION = "0.4.0";
+const SERVER_VERSION = "0.5.0";
 // Bump only on a breaking change to the guest command/result contract. sandbox_health compares
 // this with the value the guest agent reports, so a stale agent surfaces as a clear warning.
 const EXPECTED_GUEST_PROTOCOL = 1;
@@ -436,6 +436,43 @@ server.registerTool(
 );
 
 server.registerTool(
+  "sandbox_run_ps_stream",
+  {
+    title: "Run PowerShell in the Sandbox with live progress",
+    description:
+      "Run a long PowerShell command as a background job and stream its stdout to the client via MCP " +
+      "progress notifications, so the call shows live movement instead of a frozen wait — and the " +
+      "agent's command loop stays free meanwhile. Honors client cancellation (stops the job) and an " +
+      "overall timeout. Use for slow scripts/installers; for quick commands use sandbox_run_ps.",
+    inputSchema: {
+      command: z.string().describe("PowerShell command or script to run inside the Sandbox."),
+      timeoutMs: z.number().int().positive().default(600000).describe("Overall time to wait before cancelling the job."),
+    },
+  },
+  async ({ command, timeoutMs }, extra) => {
+    const { status, jobId, streamed } = await streamJob({
+      startType: "job_start_ps",
+      startArgs: { command, timeoutMs },
+      statusType: "job_status",
+      extra,
+      overallTimeoutMs: timeoutMs,
+      startTimeoutMs: 30000,
+      startLabel: "starting job…",
+    });
+    return text({
+      jobId,
+      streamed,
+      status: status.status,
+      exitCode: status.exitCode ?? null,
+      timedOut: status.timedOut ?? false,
+      cancelled: status.cancelled ?? false,
+      stdoutTail: status.stdoutTail ?? [],
+      stderrTail: status.stderrTail ?? [],
+    });
+  },
+);
+
+server.registerTool(
   "sandbox_winget_bootstrap",
   {
     title: "Install WinGet in the Sandbox",
@@ -452,92 +489,129 @@ server.registerTool(
     text((await sendCommand("winget_bootstrap", { skipIfAvailable, timeoutMs }, timeoutMs + 30000)).data),
 );
 
-// Run a winget install/upgrade as a guest background job and stream progress to the client via
-// MCP progress notifications, so a long install shows live movement instead of a frozen call. The
-// install runs in a separate process, so the agent's command loop stays free to answer status
-// polls. Returns the same structured shape as the synchronous winget path.
-async function runWingetStreaming(args: Record<string, any>, extra: any): Promise<any> {
-  const action = args.action;
-  const overallTimeoutMs = args.timeoutMs && args.timeoutMs > 0 ? args.timeoutMs : 600000;
+const JOB_DONE_STATES = ["completed", "timedOut", "cancelled", "unknown"];
+
+// Generic "run a guest background job and stream its progress" engine. Starts the job (returns
+// fast), then polls a status command, emitting MCP progress notifications for each new output line
+// — and a numeric progress bar when the status carries one (e.g. winget's download %). The job
+// runs in its own process, so the agent's command loop stays free. Survives a single poll hiccup,
+// honors MCP cancellation, and enforces an overall deadline (cancelling the job on timeout).
+async function streamJob(opts: {
+  startType: string;
+  startArgs: Record<string, any>;
+  statusType: string;
+  extra: any;
+  overallTimeoutMs: number;
+  startTimeoutMs: number;
+  startLabel: string;
+}): Promise<{ start: any; status: any; jobId: string; streamed: boolean }> {
+  const { startType, startArgs, statusType, extra, overallTimeoutMs, startTimeoutMs, startLabel } = opts;
   const progressToken = extra?._meta?.progressToken;
-  let progress = 0;
-  const emit = (message: string) => {
-    if (progressToken === undefined || progressToken === null) return;
-    progress += 1;
-    void extra
-      .sendNotification({ method: "notifications/progress", params: { progressToken, progress, message } })
-      .catch(() => {});
+  const streamed = progressToken !== undefined && progressToken !== null;
+  let seq = 0;
+  const emit = (message: string, numeric?: { progress: number; total: number }) => {
+    if (!streamed) return;
+    seq += 1;
+    const params: any = { progressToken, message };
+    if (numeric) {
+      params.progress = numeric.progress;
+      params.total = numeric.total;
+    } else {
+      params.progress = seq;
+    }
+    void extra.sendNotification({ method: "notifications/progress", params }).catch(() => {});
   };
 
-  const target = (args.packageId ?? args.query ?? "").toString();
-  emit(`winget ${action} ${target}: starting…`.trim());
-  // winget_start does any one-time bootstrap inline, then launches the install as a job.
-  const start = (await sendCommand("winget_start", args, Math.max(overallTimeoutMs, 330000) + 30000)).data;
+  emit(startLabel);
+  const start = (await sendCommand(startType, startArgs, startTimeoutMs)).data;
   const jobId = start.jobId;
-  if (!jobId) throw new Error("winget_start did not return a jobId");
+  if (!jobId) throw new Error(`${startType} did not return a jobId`);
   if (start.source) emit(`source: ${start.source}`);
+
+  const lineOf = (status: any): string => {
+    const out = (status.output ?? "").trim();
+    if (out) return out.split("\n").pop()!.trim();
+    const tail = Array.isArray(status.stdoutTail) ? status.stdoutTail : [];
+    for (let i = tail.length - 1; i >= 0; i--) {
+      const t = String(tail[i]).trim();
+      if (t) return t;
+    }
+    return "";
+  };
+  const isDone = (status: any): boolean =>
+    status.done === true || (typeof status.status === "string" && JOB_DONE_STATES.includes(status.status));
+
+  const finalize = async (): Promise<any> => {
+    try {
+      await sendCommand("job_cancel", { jobId }, 30000);
+    } catch {
+      /* best effort */
+    }
+    try {
+      return (await sendCommand(statusType, { jobId }, 30000)).data;
+    } catch {
+      return null;
+    }
+  };
 
   const deadline = Date.now() + overallTimeoutMs;
   let lastLine = "";
   let status: any = null;
   for (;;) {
     try {
-      status = (await sendCommand("winget_status", { jobId }, 30000)).data;
-      const out = (status.output ?? "").trim();
-      if (out) {
-        const line = out.split("\n").pop()!.trim();
-        if (line && line !== lastLine) {
-          lastLine = line;
-          emit(line);
-        }
+      status = (await sendCommand(statusType, { jobId }, 30000)).data;
+      const line = lineOf(status);
+      if (line && line !== lastLine) {
+        lastLine = line;
+        const pct = status.progress?.percent;
+        // Collapse winget's noisy progress-bar line (byte fractions / repeated %) to a clean
+        // "downloading N%"; leave real text lines (Downloading <url>, Starting install…) as-is.
+        const isBar = /\d+(?:\.\d+)?\s*(?:B|KB|MB|GB)\s*\/|\d+\s*%/.test(line);
+        const message = isBar && typeof pct === "number" ? `downloading ${pct}%` : line;
+        emit(message, typeof pct === "number" ? { progress: pct, total: 100 } : undefined);
       }
-      if (status.done) break;
+      if (isDone(status)) break;
     } catch (e) {
-      // A single poll hiccup must not abort the stream — the install keeps running in its own
-      // process. Keep polling until the install reports done or the overall deadline passes.
+      // A single poll hiccup must not abort the stream — the job runs in its own process.
       emit(`(status poll retry: ${(e as Error).message})`);
     }
-    // Honor MCP cancellation: if the client cancels the tool call, stop the install rather than
-    // letting it run on invisibly in the Sandbox.
     if (extra?.signal?.aborted) {
-      emit("cancelled by client — stopping install");
-      try {
-        await sendCommand("job_cancel", { jobId }, 30000);
-      } catch {
-        /* best effort */
-      }
-      try {
-        status = (await sendCommand("winget_status", { jobId }, 30000)).data;
-      } catch {
-        /* keep last status */
-      }
+      emit("cancelled by client — stopping job");
+      status = (await finalize()) ?? status;
       break;
     }
     if (Date.now() >= deadline) {
-      try {
-        await sendCommand("job_cancel", { jobId }, 30000);
-      } catch {
-        /* best effort */
-      }
-      try {
-        status = (await sendCommand("winget_status", { jobId }, 30000)).data;
-      } catch {
-        /* keep whatever last status we had */
-      }
+      status = (await finalize()) ?? status;
       break;
     }
     await new Promise((r) => setTimeout(r, 800));
   }
-  if (!status) throw new Error("winget streaming produced no status");
-  emit(status.message ?? `winget ${action} finished (${status.outcome ?? status.status})`);
+  if (!status) throw new Error(`${statusType} produced no status`);
+  emit(status.message ?? `finished (${status.outcome ?? status.status})`);
+  return { start, status, jobId, streamed };
+}
 
+// Stream a winget install/upgrade and return the same structured shape as the synchronous path.
+async function runWingetStreaming(args: Record<string, any>, extra: any): Promise<any> {
+  const action = args.action;
+  const overallTimeoutMs = args.timeoutMs && args.timeoutMs > 0 ? args.timeoutMs : 600000;
+  const target = (args.packageId ?? args.query ?? "").toString();
+  const { start, status, jobId, streamed } = await streamJob({
+    startType: "winget_start",
+    startArgs: args,
+    statusType: "winget_status",
+    extra,
+    overallTimeoutMs,
+    startTimeoutMs: Math.max(overallTimeoutMs, 330000) + 30000, // bootstrap can run inline in winget_start
+    startLabel: `winget ${action} ${target}: starting…`.trim(),
+  });
   return {
     action,
     packageId: args.packageId ?? "",
     query: args.query ?? "",
     source: start.source,
     jobId,
-    streamed: progressToken !== undefined && progressToken !== null,
+    streamed,
     succeeded: status.succeeded ?? false,
     outcome: status.outcome ?? status.status,
     exit: status.exit ?? null,
@@ -606,11 +680,29 @@ server.registerTool(
 // Turn a snapshot diff into candidate Intune-style detection rules, best first. An MSI product
 // code is the most reliable signal; otherwise the program's uninstall key (DisplayVersion, or mere
 // presence) and finally a notable new executable.
-function synthesizeDetectionRules(diff: any): any[] {
+function synthesizeDetectionRules(diff: any, hint?: string): any[] {
   const rules: any[] = [];
   // The diff payload caps lists as { items, truncated }; tolerate a bare array too.
   const asArr = (x: any): any[] => (Array.isArray(x) ? x : (x?.items ?? []));
-  const addedPrograms: any[] = asArr(diff?.diff?.programs?.added);
+  let addedPrograms: any[] = asArr(diff?.diff?.programs?.added);
+
+  // An install often drags in runtimes (VC++ redist, .NET) — detect the APP, not its dependencies.
+  // Rank: name matches the requested package first, plain apps next, redistributable runtimes last.
+  const isRuntime = (p: any) => /visual c\+\+|redistributable|\bruntime\b|\.net\b|webview/i.test(p.displayName ?? "");
+  const tokens = (hint ?? "")
+    .toLowerCase()
+    .split(/[.\s_-]+/)
+    .filter((t) => t.length >= 3);
+  const matchesHint = (p: any) => {
+    const hay = `${p.displayName ?? ""} ${p.id ?? ""}`.toLowerCase();
+    return tokens.some((t) => hay.includes(t));
+  };
+  if (addedPrograms.length > 1) {
+    addedPrograms = [...addedPrograms].sort((a, b) => {
+      const score = (p: any) => (matchesHint(p) ? 0 : 1) + (isRuntime(p) ? 2 : 0);
+      return score(a) - score(b);
+    });
+  }
   const isMsiGuid = (s: string) => /^\{[0-9a-fA-F-]{32,38}\}$/.test(s ?? "");
   for (const p of addedPrograms) {
     if (isMsiGuid(p.id)) {
@@ -705,7 +797,7 @@ server.registerTool(
     );
     const after = (await sendCommand("snapshot_capture", { label: "after-install", ...snapOpts }, 300000)).data;
     const diff = await diffSnapshots({ bridgeRoot }, before.snapshotId, after.snapshotId, new Date().toISOString());
-    const detectionRules = synthesizeDetectionRules(diff);
+    const detectionRules = synthesizeDetectionRules(diff, args.packageId ?? args.query);
 
     let verification: any = null;
     if (args.verify && detectionRules.length) {
@@ -719,8 +811,77 @@ server.registerTool(
 
     return text({
       install: { succeeded: install.succeeded, outcome: install.outcome, exit: install.exit, message: install.message, source: install.source },
+      // The pre-install snapshot is the clean baseline; pass it to sandbox_uninstall_and_profile
+      // later as baselineSnapshotId to measure uninstall residue.
+      baselineSnapshotId: before.snapshotId,
+      afterSnapshotId: after.snapshotId,
       footprint: { counts: diff.counts, totalChanges: diff.totalChanges, programs: diff.diff?.programs, services: diff.diff?.services, artifacts: diff.artifacts },
       detectionRules,
+      verification,
+    });
+  },
+);
+
+server.registerTool(
+  "sandbox_uninstall_and_profile",
+  {
+    title: "Uninstall, then profile what was removed and what leaked",
+    description:
+      "The cleanup half of the packaging loop: snapshot, uninstall the package with WinGet (streaming " +
+      "progress), snapshot again, and diff to show what the uninstaller REMOVED. If you pass the " +
+      "baselineSnapshotId from a prior sandbox_install_and_profile, it also diffs the clean baseline " +
+      "against the post-uninstall state to surface RESIDUE (files/registry/programs left behind). If " +
+      "you pass the detectionRule, it verifies the app is now undetected (expectedPresent=false). Use " +
+      "this to prove a clean uninstall and an honest Intune detection rule.",
+    inputSchema: {
+      packageId: z.string().optional().describe("WinGet package id to uninstall."),
+      query: z.string().optional().describe("Free-text package query when packageId is unknown."),
+      exact: z.boolean().optional().describe("Add --exact (defaults true when packageId is given)."),
+      customArgs: z.array(z.string()).optional().describe("Extra raw WinGet arguments (e.g. --purge)."),
+      timeoutMs: z.number().int().nonnegative().optional().describe("Uninstall timeout; omit for the 600000 ms default."),
+      baselineSnapshotId: z.string().optional().describe("Clean pre-install snapshot id (from sandbox_install_and_profile) to measure residue against."),
+      detectionRule: z.any().optional().describe("Detection rule to verify is now ABSENT after uninstall (expectedPresent=false)."),
+      includeFiles: z.boolean().default(false).describe("Also snapshot/diff files (slower). Needed to see file-level residue."),
+      verify: z.boolean().default(true).describe("Verify the detection rule reports absent after uninstall (when a rule is given)."),
+    },
+  },
+  async (args, extra) => {
+    const snapOpts = { includeFiles: args.includeFiles ?? false, includeRegistry: true, includePrograms: true, includeServices: true };
+    const before = (await sendCommand("snapshot_capture", { label: "before-uninstall", ...snapOpts }, 300000)).data;
+    const uninstall = await runWingetStreaming(
+      {
+        action: "uninstall",
+        packageId: args.packageId,
+        query: args.query,
+        exact: args.exact,
+        customArgs: args.customArgs,
+        timeoutMs: args.timeoutMs,
+      },
+      extra,
+    );
+    const after = (await sendCommand("snapshot_capture", { label: "after-uninstall", ...snapOpts }, 300000)).data;
+
+    const removed = await diffSnapshots({ bridgeRoot }, before.snapshotId, after.snapshotId, new Date().toISOString());
+    let residue: any = null;
+    if (args.baselineSnapshotId) {
+      const r = await diffSnapshots({ bridgeRoot }, args.baselineSnapshotId, after.snapshotId, new Date().toISOString());
+      // Anything present after uninstall but absent in the clean baseline = leftover residue.
+      residue = { counts: r.counts, leftovers: { programs: r.diff?.programs?.added, registry: r.diff?.registry?.added, files: r.diff?.files?.added, services: r.diff?.services?.added }, artifacts: r.artifacts };
+    }
+
+    let verification: any = null;
+    if (args.verify && args.detectionRule) {
+      try {
+        verification = (await sendCommand("detection_verify", { rule: args.detectionRule, expectedPresent: false }, 35000)).data;
+      } catch (e) {
+        verification = { error: (e as Error).message };
+      }
+    }
+
+    return text({
+      uninstall: { succeeded: uninstall.succeeded, outcome: uninstall.outcome, exit: uninstall.exit, message: uninstall.message },
+      removed: { counts: removed.counts, programs: removed.diff?.programs, registry: removed.diff?.registry, services: removed.diff?.services, artifacts: removed.artifacts },
+      residue,
       verification,
     });
   },

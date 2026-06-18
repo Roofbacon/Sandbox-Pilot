@@ -91,9 +91,26 @@ test("the event bus auto-starts and emits program/file events with a generalized
   assert.match(serverSrc, /"sandbox_wait_for_event"/);
 });
 
-test("server and guest version are bumped to 0.4.0 so a stale agent is visible", () => {
-  assert.match(serverSrc, /SERVER_VERSION\s*=\s*"0\.4\.0"/);
-  assert.match(guestSrc, /\$AgentVersion\s*=\s*"0\.4\.0"/);
+test("server and guest version are bumped to 0.5.0 so a stale agent is visible", () => {
+  assert.match(serverSrc, /SERVER_VERSION\s*=\s*"0\.5\.0"/);
+  assert.match(guestSrc, /\$AgentVersion\s*=\s*"0\.5\.0"/);
+});
+
+test("0.5.0-C: numeric progress + generic job streaming", () => {
+  // Guest parses winget's byte fraction into a numeric percent.
+  assert.match(guestSrc, /function Get-WinGetProgress/);
+  // Server has a generic streamer and a streamed run_ps tool; numeric progress flows through.
+  assert.match(serverSrc, /async function streamJob/);
+  assert.match(serverSrc, /"sandbox_run_ps_stream"/);
+  assert.match(serverSrc, /progress:\s*pct|progress:\s*numeric\.progress/);
+});
+
+test("0.5.0: uninstall + residue profiling", () => {
+  assert.match(serverSrc, /"sandbox_uninstall_and_profile"/);
+  assert.match(serverSrc, /baselineSnapshotId/);
+  assert.match(serverSrc, /residue/);
+  // install_and_profile exposes the clean baseline snapshot id for residue chaining.
+  assert.match(serverSrc, /baselineSnapshotId:\s*before\.snapshotId/);
 });
 
 test("0.4.0-A: streaming honors MCP cancellation and the socket loop is hardened", () => {
