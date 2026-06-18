@@ -18,7 +18,7 @@ const TRANSPORT = process.env.SANDBOX_TRANSPORT === "socket" ? socketBridge : fi
 const sendCommand = TRANSPORT.sendCommand;
 const screenshot = TRANSPORT.screenshot;
 
-const SERVER_VERSION = "0.3.0";
+const SERVER_VERSION = "0.4.0";
 // Bump only on a breaking change to the guest command/result contract. sandbox_health compares
 // this with the value the guest agent reports, so a stale agent surfaces as a clear warning.
 const EXPECTED_GUEST_PROTOCOL = 1;
@@ -497,6 +497,22 @@ async function runWingetStreaming(args: Record<string, any>, extra: any): Promis
       // process. Keep polling until the install reports done or the overall deadline passes.
       emit(`(status poll retry: ${(e as Error).message})`);
     }
+    // Honor MCP cancellation: if the client cancels the tool call, stop the install rather than
+    // letting it run on invisibly in the Sandbox.
+    if (extra?.signal?.aborted) {
+      emit("cancelled by client — stopping install");
+      try {
+        await sendCommand("job_cancel", { jobId }, 30000);
+      } catch {
+        /* best effort */
+      }
+      try {
+        status = (await sendCommand("winget_status", { jobId }, 30000)).data;
+      } catch {
+        /* keep last status */
+      }
+      break;
+    }
     if (Date.now() >= deadline) {
       try {
         await sendCommand("job_cancel", { jobId }, 30000);
@@ -584,6 +600,129 @@ server.registerTool(
     return text(
       (await sendCommand("winget", args, (args.timeoutMs && args.timeoutMs > 0 ? args.timeoutMs : 600000) + 30000)).data,
     );
+  },
+);
+
+// Turn a snapshot diff into candidate Intune-style detection rules, best first. An MSI product
+// code is the most reliable signal; otherwise the program's uninstall key (DisplayVersion, or mere
+// presence) and finally a notable new executable.
+function synthesizeDetectionRules(diff: any): any[] {
+  const rules: any[] = [];
+  // The diff payload caps lists as { items, truncated }; tolerate a bare array too.
+  const asArr = (x: any): any[] => (Array.isArray(x) ? x : (x?.items ?? []));
+  const addedPrograms: any[] = asArr(diff?.diff?.programs?.added);
+  const isMsiGuid = (s: string) => /^\{[0-9a-fA-F-]{32,38}\}$/.test(s ?? "");
+  for (const p of addedPrograms) {
+    if (isMsiGuid(p.id)) {
+      rules.push({
+        kind: "msiProductCode",
+        confidence: "high",
+        rule: { type: "msiProductCode", productCode: p.id, ...(p.displayVersion ? { productVersion: p.displayVersion } : {}) },
+        rationale: `MSI product code for "${p.displayName ?? p.id}"${p.displayVersion ? ` v${p.displayVersion}` : ""}.`,
+      });
+    } else if (p.keyPath && p.displayVersion) {
+      rules.push({
+        kind: "registryVersion",
+        confidence: "high",
+        rule: { type: "registry", path: p.keyPath, valueName: "DisplayVersion", operator: "equals", value: p.displayVersion },
+        rationale: `Uninstall-key DisplayVersion for "${p.displayName ?? p.id}" equals ${p.displayVersion}.`,
+      });
+    } else if (p.keyPath) {
+      rules.push({
+        kind: "registryPresence",
+        confidence: "medium",
+        rule: { type: "registry", path: p.keyPath },
+        rationale: `Uninstall key present for "${p.displayName ?? p.id}".`,
+      });
+    }
+  }
+  if (rules.length === 0) {
+    // Fall back to a notable new executable under a program-files path.
+    const addedFiles: any[] = asArr(diff?.diff?.files?.added);
+    const exe = addedFiles.find((f) => /\.exe$/i.test(f.path) && /program files/i.test(f.path)) ?? addedFiles.find((f) => /\.exe$/i.test(f.path));
+    if (exe) {
+      rules.push({
+        kind: "filePresence",
+        confidence: "low",
+        rule: { type: "file", path: exe.path },
+        rationale: `New executable installed at ${exe.path}.`,
+      });
+    }
+  }
+  if (rules.length) rules[0].recommended = true;
+  return rules;
+}
+
+server.registerTool(
+  "sandbox_install_and_profile",
+  {
+    title: "Install, profile the footprint, and synthesize a detection rule",
+    description:
+      "The full app-packaging loop in one call: snapshot the system, install the package with " +
+      "WinGet (streaming live progress), snapshot again, diff to capture the install footprint " +
+      "(new programs / registry / services, and optionally files), then synthesize candidate " +
+      "Intune-style detection rules (MSI product code → uninstall-key DisplayVersion → presence → " +
+      "new exe) and verify the recommended one inside the Sandbox. Returns the install result, the " +
+      "footprint diff, the ranked detection rules, and the verification verdict. This is what turns " +
+      "'install X' into 'here is how Intune will detect X'.",
+    inputSchema: {
+      packageId: z.string().optional().describe("WinGet package id (preferred). Run sandbox_winget action=search to find it."),
+      query: z.string().optional().describe("Free-text package query when packageId is unknown."),
+      exact: z.boolean().optional().describe("Add --exact (defaults true when packageId is given)."),
+      source: z.string().optional().describe("Explicit WinGet source; defaults to the pinned 'winget' source."),
+      preferWingetSource: z.boolean().default(true).describe("Pin --source winget when no source is given."),
+      scope: z.enum(["machine", "user"]).optional().describe("Install scope."),
+      customArgs: z.array(z.string()).optional().describe("Extra raw WinGet arguments."),
+      timeoutMs: z.number().int().nonnegative().optional().describe("Install timeout; omit for the 600000 ms default."),
+      includeFiles: z
+        .boolean()
+        .default(false)
+        .describe("Also snapshot/diff files under the common install roots. Off by default because the file scan is slow; turn on for a complete footprint or a file-based detection rule."),
+      verify: z.boolean().default(true).describe("Verify the recommended detection rule (expectedPresent=true) after install."),
+    },
+  },
+  async (args, extra) => {
+    const snapOpts = {
+      includeFiles: args.includeFiles ?? false,
+      includeRegistry: true,
+      includePrograms: true,
+      includeServices: true,
+    };
+    const before = (await sendCommand("snapshot_capture", { label: "before-install", ...snapOpts }, 300000)).data;
+    const install = await runWingetStreaming(
+      {
+        action: "install",
+        packageId: args.packageId,
+        query: args.query,
+        exact: args.exact,
+        source: args.source,
+        preferWingetSource: args.preferWingetSource,
+        scope: args.scope,
+        customArgs: args.customArgs,
+        timeoutMs: args.timeoutMs,
+      },
+      extra,
+    );
+    const after = (await sendCommand("snapshot_capture", { label: "after-install", ...snapOpts }, 300000)).data;
+    const diff = await diffSnapshots({ bridgeRoot }, before.snapshotId, after.snapshotId, new Date().toISOString());
+    const detectionRules = synthesizeDetectionRules(diff);
+
+    let verification: any = null;
+    if (args.verify && detectionRules.length) {
+      const recommended = detectionRules.find((r) => r.recommended) ?? detectionRules[0];
+      try {
+        verification = (await sendCommand("detection_verify", { rule: recommended.rule, expectedPresent: true }, 35000)).data;
+      } catch (e) {
+        verification = { error: (e as Error).message };
+      }
+    }
+
+    return text({
+      install: { succeeded: install.succeeded, outcome: install.outcome, exit: install.exit, message: install.message, source: install.source },
+      footprint: { counts: diff.counts, totalChanges: diff.totalChanges, programs: diff.diff?.programs, services: diff.diff?.services, artifacts: diff.artifacts },
+      detectionRules,
+      verification,
+    });
   },
 );
 
@@ -1239,17 +1378,21 @@ server.registerTool(
     const data = (await sendCommand("health", {}, 10000)).data ?? {};
     const guestProtocol = typeof data.protocol === "number" ? data.protocol : null;
     const compatible = guestProtocol === EXPECTED_GUEST_PROTOCOL;
+    const versionMatch = (data.version ?? null) === SERVER_VERSION;
     const compatibility = {
       serverVersion: SERVER_VERSION,
       serverProtocol: EXPECTED_GUEST_PROTOCOL,
       guestVersion: data.version ?? null,
       guestProtocol,
       compatible,
-      warning: compatible
-        ? null
-        : guestProtocol === null
+      versionMatch,
+      warning: !compatible
+        ? guestProtocol === null
           ? "Guest agent did not report a protocol version — it predates the handshake. Redeploy with reload-agent."
-          : `Guest agent protocol ${guestProtocol} != server ${EXPECTED_GUEST_PROTOCOL}. The agent is stale; redeploy with reload-agent.`,
+          : `Guest agent protocol ${guestProtocol} != server ${EXPECTED_GUEST_PROTOCOL}. The agent is stale; redeploy with reload-agent.`
+        : versionMatch
+          ? null
+          : `Guest agent version ${data.version ?? "?"} != server ${SERVER_VERSION} (protocol still compatible). Redeploy with reload-agent to pick up the newest agent.`,
     };
     return text({ ...data, compatibility });
   },

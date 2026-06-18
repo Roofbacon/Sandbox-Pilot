@@ -91,7 +91,23 @@ test("the event bus auto-starts and emits program/file events with a generalized
   assert.match(serverSrc, /"sandbox_wait_for_event"/);
 });
 
-test("server and guest version are bumped to 0.3.0 so a stale agent is visible", () => {
-  assert.match(serverSrc, /SERVER_VERSION\s*=\s*"0\.3\.0"/);
-  assert.match(guestSrc, /\$AgentVersion\s*=\s*"0\.3\.0"/);
+test("server and guest version are bumped to 0.4.0 so a stale agent is visible", () => {
+  assert.match(serverSrc, /SERVER_VERSION\s*=\s*"0\.4\.0"/);
+  assert.match(guestSrc, /\$AgentVersion\s*=\s*"0\.4\.0"/);
+});
+
+test("0.4.0-A: streaming honors MCP cancellation and the socket loop is hardened", () => {
+  assert.match(serverSrc, /signal\?\.aborted/);
+  assert.match(serverSrc, /versionMatch/);
+  // A dropped/half-open connection must not wedge the listener.
+  assert.match(guestSrc, /Accept failed/);
+  assert.match(guestSrc, /SocketOptionName\]::KeepAlive/);
+});
+
+test("0.4.0-B: install→profile→detect loop is wired", () => {
+  assert.match(serverSrc, /"sandbox_install_and_profile"/);
+  assert.match(serverSrc, /function synthesizeDetectionRules/);
+  assert.match(serverSrc, /msiProductCode/);
+  // Program snapshots carry the uninstall key path so a registry rule can target it.
+  assert.match(guestSrc, /keyPath\s*=\s*"\$base\\\$id"/);
 });

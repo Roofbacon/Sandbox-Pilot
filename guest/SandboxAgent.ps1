@@ -14,7 +14,7 @@ $ErrorActionPreference = "Stop"
 # Agent version + wire protocol. The protocol is bumped only on a breaking change to the
 # command/result contract; the MCP server compares it during sandbox_health to catch a stale
 # agent (guest/server drift) loudly instead of failing on an unknown command later.
-$AgentVersion = "0.3.0"
+$AgentVersion = "0.4.0"
 $AgentProtocol = 1
 
 # Command types this agent advertises (see Invoke-AgentCommand). Get-AgentCapabilities returns
@@ -2243,14 +2243,19 @@ function Get-InstalledProgramsSnapshot {
         "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
     )
     $programs = foreach ($path in $registryPaths) {
+        # Reconstruct the concrete uninstall key path (HKLM:\...\Uninstall\<id>) so detection-rule
+        # synthesis can target it directly instead of guessing the hive.
+        $base = ($path -replace '\\\*$', '')
         Get-ItemProperty -Path $path -ErrorAction SilentlyContinue |
             Where-Object { Get-ObjectPropertyValue -Object $_ -Name "DisplayName" } |
             ForEach-Object {
+                $id = [string](Get-ObjectPropertyValue -Object $_ -Name "PSChildName")
                 [ordered]@{
-                    id = [string](Get-ObjectPropertyValue -Object $_ -Name "PSChildName")
+                    id = $id
                     displayName = [string](Get-ObjectPropertyValue -Object $_ -Name "DisplayName")
                     displayVersion = [string](Get-ObjectPropertyValue -Object $_ -Name "DisplayVersion")
                     publisher = [string](Get-ObjectPropertyValue -Object $_ -Name "Publisher")
+                    keyPath = "$base\$id"
                 }
             }
     }
@@ -3551,8 +3556,14 @@ function Start-SocketAgent {
     $running = $true
 
     while ($running) {
-        $client = $listener.AcceptTcpClient()
+        # Accept must never let one bad/dropped connection kill the listener: a fresh client (e.g.
+        # the host reconnecting after its previous process died) has to be able to get in.
+        try { $client = $listener.AcceptTcpClient() }
+        catch { Write-AgentLog "Accept failed: $($_.Exception.Message)"; Start-Sleep -Milliseconds 200; continue }
         $client.NoDelay = $true
+        # TCP keepalive so a half-open connection (host vanished without FIN) is detected and the
+        # blocking ReadLine eventually errors out instead of wedging the agent forever.
+        try { $client.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::KeepAlive, $true) } catch { }
         Write-AgentLog "Socket client connected from $($client.Client.RemoteEndPoint)"
         $stream = $client.GetStream()
         $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
