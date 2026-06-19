@@ -31,6 +31,7 @@ Sandbox Pilot exposes [Windows Sandbox](https://learn.microsoft.com/en-us/window
 | **Install + profile** | `sandbox_install_and_profile` - the whole app-packaging loop in one call: snapshot → install → snapshot → diff the footprint → synthesize Intune-style detection rule(s) (MSI product code → uninstall-key DisplayVersion → presence → new exe) → verify the recommended rule live in the Sandbox |
 | **Installers** | `sandbox_find_install_candidates`, `sandbox_msi_inspect`, `sandbox_analyze_installers`, `sandbox_test_install_command`, `sandbox_verify_detection_rule` - inspect installer payloads, infer silent commands, verify installs, and prove detection rules in the disposable VM |
 | **Test** | `sandbox_assert` (file/registry/process/service/window/installedProgram/msiProductCode/script pass-fail checks), `sandbox_run_test_plan` - run a declarative step list and emit JUnit XML + a screenshot-embedded Markdown report |
+| **Phishing checks** | `sandbox_test_phishing_url` - take a direct URL, pasted email, or `.eml`/HTML/text file; extract links; score email/URL phishing indicators; run DNS/TLS/HTTP/redirect checks inside the Sandbox; open the selected target in Edge InPrivate; and write a Markdown + JSON evidence report |
 | **Snapshot / diff** | `sandbox_snapshot`, `sandbox_diff_snapshots` - baseline files/registry/programs/services, then diff before vs after to see exactly what an installer changed (footprint docs + uninstall-residue checks) |
 | **Diagnostics** | `sandbox_event_logs` - collect Application/System event-log entries (Critical/Error/Warning + MsiInstaller) for a time window; `sandbox_test_install_command` also captures them around the install window |
 | **Intune packaging** | `sandbox_test_intune_deployment`, `sandbox_build_packaging_dossier`, `sandbox_intune_prereqs`, `sandbox_intune_package_win32`, `sandbox_intune_package_from_host` - run an IME-style install/uninstall simulation, verify detection, build a packaging dossier, auto-install Microsoft's Win32 Content Prep Tool if needed, and save `.intunewin` packages to shared artifacts |
@@ -202,6 +203,27 @@ For operations that may outlive a normal MCP tool call, use `sandbox_start_job` 
   ]
 }
 ```
+
+## Phishing URL/email workflow
+
+`sandbox_test_phishing_url` is built for the workflow where a user gives an agent either a
+single URL or a whole suspicious email. The tool accepts:
+
+- `url` for a direct URL.
+- `emailText` for pasted raw email source, rendered text, or HTML.
+- `emailHostPath` for a host-side `.eml`, `.html`, or `.txt` artifact.
+- `emailGuestPath` for an email artifact already visible inside the Sandbox.
+
+For an email, the tool extracts links from plain text and HTML anchors, flags mismatched
+displayed-link text, scores URL indicators such as link shorteners, punycode, IP hosts,
+non-HTTPS links, long/encoded URLs, suspicious credential/payment terms, and direct payload
+downloads, then runs live DNS/TLS/HTTP/redirect checks from inside the Sandbox.
+
+By default it opens the highest-risk extracted URL in Microsoft Edge InPrivate, waits for the
+page to settle, captures foreground UI evidence, and writes both `report.md` and `results.json`
+under `bridge\artifacts\phishing-url-tests\<runId>`. Use `foregroundMode: "none"` for
+background-only triage, `"first"` for the first extracted URL, or `"all"` when you want every
+extracted target opened in Edge.
 
 ## Footprint & residue workflow
 

@@ -12,6 +12,7 @@ import { diffSnapshots } from "./snapshot.js";
 import { buildGuideDocs } from "./guidedoc.js";
 import { cleanupArtifacts } from "./cleanup.js";
 import { buildPackagingDossier } from "./dossier.js";
+import { runEmailUrlPhishingTest } from "./phishing.js";
 
 // Transport: "socket" (low latency, guest listens / host connects out) or the default
 // file bridge (shared folder; simpler but ~20s host->guest propagation).
@@ -1389,6 +1390,42 @@ server.registerTool(
       await runTestPlan(
         { sendCommand, screenshot, bridgeRoot, toBridgeHostPath },
         { name, steps },
+        new Date().toISOString(),
+      ),
+    ),
+);
+
+server.registerTool(
+  "sandbox_test_phishing_url",
+  {
+    title: "Test URL/email for phishing indicators",
+    description:
+      "Analyze a user-supplied URL or a whole email for phishing indicators inside the disposable Sandbox. " +
+      "The tool extracts http/https links from raw text, HTML, or EML content; scores static email/URL signals " +
+      "(mismatched link text, shorteners, punycode, IP hosts, suspicious payloads, non-HTTPS, long/encoded URLs); " +
+      "runs background DNS/TLS/HTTP/redirect checks from inside the Sandbox; then opens the selected target in " +
+      "Microsoft Edge InPrivate and captures foreground UI evidence. It writes a Markdown report and results.json " +
+      "under bridge\\artifacts\\phishing-url-tests. Default foreground behavior opens the highest-risk extracted URL.",
+    inputSchema: {
+      url: z.string().optional().describe("A single URL to test directly."),
+      emailText: z.string().optional().describe("Raw email source, rendered email text, or HTML body to extract URLs from."),
+      emailHostPath: z.string().optional().describe("Host path to an .eml/.html/.txt email artifact to read and analyze."),
+      emailGuestPath: z.string().optional().describe("Guest path inside the Sandbox to an email artifact to read and analyze."),
+      maxUrls: z.number().int().min(1).max(50).default(10).describe("Maximum extracted URLs to analyze."),
+      foregroundMode: z
+        .enum(["none", "first", "highestRisk", "all"])
+        .default("highestRisk")
+        .describe("Which URL(s) to open in Edge after background checks."),
+      waitMs: z.number().int().min(1000).max(60000).default(8000).describe("Milliseconds to wait after opening Edge before collecting foreground evidence."),
+      captureScreenshot: z.boolean().default(true).describe("Capture a foreground Edge screenshot for the report."),
+      timeoutMs: z.number().int().min(5000).max(120000).default(30000).describe("Timeout for each background PowerShell URL check."),
+    },
+  },
+  async (args) =>
+    text(
+      await runEmailUrlPhishingTest(
+        { sendCommand, screenshot, bridgeRoot },
+        args,
         new Date().toISOString(),
       ),
     ),
