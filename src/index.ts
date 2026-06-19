@@ -18,7 +18,7 @@ const TRANSPORT = process.env.SANDBOX_TRANSPORT === "socket" ? socketBridge : fi
 const sendCommand = TRANSPORT.sendCommand;
 const screenshot = TRANSPORT.screenshot;
 
-const SERVER_VERSION = "0.5.0";
+const SERVER_VERSION = "0.6.0";
 // Bump only on a breaking change to the guest command/result contract. sandbox_health compares
 // this with the value the guest agent reports, so a stale agent surfaces as a clear warning.
 const EXPECTED_GUEST_PROTOCOL = 1;
@@ -1049,9 +1049,13 @@ server.registerTool(
       watchProcesses: z.boolean().default(true).describe("Emit processStarted/processExited events (by process name)."),
       watchForeground: z.boolean().default(true).describe("Emit foregroundChanged events."),
       watchPrograms: z.boolean().default(true).describe("Emit programInstalled/programRemoved events (uninstall registry diff)."),
-      watchFiles: z.boolean().default(true).describe("Emit fileCreated/fileRemoved events for the watched dirs."),
-      scanEveryTicks: z.number().int().positive().default(5).describe("Run the heavier program/file scans every Nth interval (throttle)."),
-      watchDirs: z.array(z.string()).optional().describe("Dirs to watch for file events. Defaults to the user's Downloads, Desktop, and Public Desktop."),
+      watchFiles: z.boolean().default(true).describe("Emit fileCreated/fileRemoved/fileRenamed events for the watched dirs."),
+      useFsWatcher: z.boolean().default(true).describe("Use a real-time recursive FileSystemWatcher for file events (vs a shallow poll fallback)."),
+      watchServices: z.boolean().default(true).describe("Emit serviceInstalled/serviceRemoved/serviceStateChanged events."),
+      watchScheduledTasks: z.boolean().default(true).describe("Emit scheduledTaskAdded/scheduledTaskRemoved events."),
+      watchRunKeys: z.boolean().default(true).describe("Emit autorunAdded/autorunRemoved/autorunChanged events (Run/RunOnce keys)."),
+      scanEveryTicks: z.number().int().positive().default(5).describe("Run the heavier program/service/task/registry scans every Nth interval (throttle)."),
+      watchDirs: z.array(z.string()).optional().describe("Dirs to watch for file events (recursive). Defaults to the user's Downloads, Desktop, and Public Desktop."),
     },
   },
   async (args) => {
@@ -1120,6 +1124,15 @@ server.registerTool(
             "programRemoved",
             "fileCreated",
             "fileRemoved",
+            "fileRenamed",
+            "serviceInstalled",
+            "serviceRemoved",
+            "serviceStateChanged",
+            "scheduledTaskAdded",
+            "scheduledTaskRemoved",
+            "autorunAdded",
+            "autorunRemoved",
+            "autorunChanged",
           ]),
         )
         .optional()

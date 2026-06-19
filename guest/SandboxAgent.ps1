@@ -14,7 +14,7 @@ $ErrorActionPreference = "Stop"
 # Agent version + wire protocol. The protocol is bumped only on a breaking change to the
 # command/result contract; the MCP server compares it during sandbox_health to catch a stale
 # agent (guest/server drift) loudly instead of failing on an unknown command later.
-$AgentVersion = "0.5.0"
+$AgentVersion = "0.6.0"
 $AgentProtocol = 1
 
 # Command types this agent advertises (see Invoke-AgentCommand). Get-AgentCapabilities returns
@@ -651,6 +651,46 @@ public static class SbxWinEnum {
 "@
     }
 
+    # Real-time recursive file monitor. FileSystemWatcher raises events on threadpool threads; a C#
+    # helper funnels them into a thread-safe queue that the (single-threaded) watcher loop drains,
+    # so file-change ids stay collision-free without PowerShell eventing. Event-driven, so it does
+    # not enumerate the tree the way a recursive poll would.
+    if (-not ([System.Management.Automation.PSTypeName]'SbxFsMonitor').Type) {
+        Add-Type @"
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+public class SbxFsMonitor : IDisposable {
+    private readonly List<FileSystemWatcher> _watchers = new List<FileSystemWatcher>();
+    private readonly ConcurrentQueue<string> _q = new ConcurrentQueue<string>();
+    public SbxFsMonitor(string[] paths) {
+        foreach (var p in paths) {
+            try {
+                if (string.IsNullOrEmpty(p) || !Directory.Exists(p)) continue;
+                var w = new FileSystemWatcher(p);
+                w.IncludeSubdirectories = true;
+                w.NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName;
+                w.InternalBufferSize = 65536;
+                w.Created += (s, e) => _q.Enqueue("fileCreated\t" + e.FullPath);
+                w.Deleted += (s, e) => _q.Enqueue("fileRemoved\t" + e.FullPath);
+                w.Renamed += (s, e) => _q.Enqueue("fileRenamed\t" + e.FullPath);
+                w.EnableRaisingEvents = true;
+                _watchers.Add(w);
+            } catch { }
+        }
+    }
+    public List<string> Drain(int max) {
+        var r = new List<string>();
+        string item;
+        while (r.Count < max && _q.TryDequeue(out item)) r.Add(item);
+        return r;
+    }
+    public void Dispose() { foreach (var w in _watchers) { try { w.Dispose(); } catch { } } _watchers.Clear(); }
+}
+"@
+    }
+
     $script:nextId = 1
     $cap = 2000
     $emit = {
@@ -681,7 +721,8 @@ public static class SbxWinEnum {
         }
         return $set
     }
-    # Read the set of files (full paths) sitting directly in the watched directories.
+    # Read the set of files (full paths) sitting directly in the watched directories. Only used as
+    # a fallback when the real-time FileSystemWatcher could not start.
     $readFiles = {
         param($Dirs)
         $set = @{}
@@ -691,9 +732,51 @@ public static class SbxWinEnum {
         }
         return $set
     }
+    # Services: name -> "status|startType", to detect install/removal and state changes.
+    $readServices = {
+        $set = @{}
+        foreach ($s in (Get-Service -ErrorAction SilentlyContinue)) { $set["$($s.Name)"] = "$($s.Status)|$($s.StartType)" }
+        return $set
+    }
+    # Scheduled tasks: full path\name set.
+    $readTasks = {
+        $set = @{}
+        try { foreach ($t in (Get-ScheduledTask -ErrorAction SilentlyContinue)) { $set["$($t.TaskPath)$($t.TaskName)"] = $true } } catch { }
+        return $set
+    }
+    # Autoruns: Run/RunOnce values (HKLM + HKCU, native + WOW6432), keyed name -> command.
+    $readRunKeys = {
+        $set = @{}
+        $roots = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run',
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
+        )
+        foreach ($root in $roots) {
+            if (-not (Test-Path -LiteralPath $root)) { continue }
+            $props = Get-ItemProperty -LiteralPath $root -ErrorAction SilentlyContinue
+            if (-not $props) { continue }
+            foreach ($p in $props.PSObject.Properties) {
+                if ($p.Name -like 'PS*') { continue }
+                $set["$root\$($p.Name)"] = [string]$p.Value
+            }
+        }
+        return $set
+    }
+
+    # Bring up the real-time recursive file monitor (best-effort; fall back to polling if it fails).
+    $fsMon = $null; $fsActive = $false
+    if ($Control['WatchFiles'] -and $Control['UseFsWatcher']) {
+        try { $fsMon = [SbxFsMonitor]::new([string[]]@($Control['WatchDirs'])); $fsActive = $true }
+        catch { $Control['Error'] = "FS watcher init failed: $($_.Exception.Message)" }
+    }
 
     $prevTitles = @{}; $prevFg = $null; $prevProcs = @{}; $prevPrograms = @{}; $prevFiles = @{}
-    $seeded = $false; $progSeeded = $false; $fileSeeded = $false; $tick = 0
+    $prevServices = @{}; $prevTasks = @{}; $prevRunKeys = @{}
+    $seeded = $false; $progSeeded = $false; $fileSeeded = $false
+    $svcSeeded = $false; $taskSeeded = $false; $runSeeded = $false; $tick = 0
     while ($Control['Running']) {
         try {
             $cur = @{}; foreach ($t in [SbxWinEnum]::Titles()) { $cur[$t] = $true }
@@ -718,7 +801,16 @@ public static class SbxWinEnum {
             }
             $seeded = $true
 
-            # Throttle the heavier registry/file scans: run them every Nth tick, not every interval.
+            # Real-time file events: drain the FileSystemWatcher queue every tick (capped so an
+            # installer unpacking thousands of files can't flood the buffer in one go).
+            if ($fsActive -and $fsMon) {
+                foreach ($rec in $fsMon.Drain(80)) {
+                    $parts = $rec -split "`t", 2
+                    if ($parts.Count -eq 2) { & $emit $parts[0] $parts[1] }
+                }
+            }
+
+            # Throttle the heavier registry/service/task scans: run them every Nth tick.
             $scanEvery = [int]$Control['ScanEveryTicks']; if ($scanEvery -lt 1) { $scanEvery = 5 }
             if (($tick % $scanEvery) -eq 0) {
                 if ($Control['WatchPrograms']) {
@@ -729,7 +821,8 @@ public static class SbxWinEnum {
                     }
                     $prevPrograms = $progs; $progSeeded = $true
                 }
-                if ($Control['WatchFiles']) {
+                # Poll-based file diff only when the real-time watcher isn't active.
+                if ($Control['WatchFiles'] -and -not $fsActive) {
                     $files = & $readFiles ($Control['WatchDirs'])
                     if ($fileSeeded) {
                         foreach ($f in $files.Keys) { if (-not $prevFiles.ContainsKey($f)) { & $emit "fileCreated" $f } }
@@ -737,12 +830,43 @@ public static class SbxWinEnum {
                     }
                     $prevFiles = $files; $fileSeeded = $true
                 }
+                if ($Control['WatchServices']) {
+                    $svcs = & $readServices
+                    if ($svcSeeded) {
+                        foreach ($n in $svcs.Keys) {
+                            if (-not $prevServices.ContainsKey($n)) { & $emit "serviceInstalled" $n }
+                            elseif ($prevServices[$n] -ne $svcs[$n]) { & $emit "serviceStateChanged" "$n ($($svcs[$n]))" }
+                        }
+                        foreach ($n in $prevServices.Keys) { if (-not $svcs.ContainsKey($n)) { & $emit "serviceRemoved" $n } }
+                    }
+                    $prevServices = $svcs; $svcSeeded = $true
+                }
+                if ($Control['WatchScheduledTasks']) {
+                    $tasks = & $readTasks
+                    if ($taskSeeded) {
+                        foreach ($n in $tasks.Keys) { if (-not $prevTasks.ContainsKey($n)) { & $emit "scheduledTaskAdded" $n } }
+                        foreach ($n in $prevTasks.Keys) { if (-not $tasks.ContainsKey($n)) { & $emit "scheduledTaskRemoved" $n } }
+                    }
+                    $prevTasks = $tasks; $taskSeeded = $true
+                }
+                if ($Control['WatchRunKeys']) {
+                    $runs = & $readRunKeys
+                    if ($runSeeded) {
+                        foreach ($n in $runs.Keys) {
+                            if (-not $prevRunKeys.ContainsKey($n)) { & $emit "autorunAdded" "$n = $($runs[$n])" }
+                            elseif ($prevRunKeys[$n] -ne $runs[$n]) { & $emit "autorunChanged" "$n = $($runs[$n])" }
+                        }
+                        foreach ($n in $prevRunKeys.Keys) { if (-not $runs.ContainsKey($n)) { & $emit "autorunRemoved" $n } }
+                    }
+                    $prevRunKeys = $runs; $runSeeded = $true
+                }
             }
             $tick++
         }
         catch { $Control['Error'] = $_.Exception.Message }
         Start-Sleep -Milliseconds ([int]$Control['IntervalMs'])
     }
+    if ($fsMon) { try { $fsMon.Dispose() } catch { } }
 }
 
 function Get-WatcherStatus {
@@ -761,6 +885,10 @@ function Start-SandboxWatcher {
         [bool]$WatchForeground = $true,
         [bool]$WatchPrograms = $true,
         [bool]$WatchFiles = $true,
+        [bool]$UseFsWatcher = $true,
+        [bool]$WatchServices = $true,
+        [bool]$WatchScheduledTasks = $true,
+        [bool]$WatchRunKeys = $true,
         [int]$ScanEveryTicks = 5,
         [string[]]$WatchDirs = @()
     )
@@ -782,6 +910,8 @@ function Start-SandboxWatcher {
     $script:WatchControl = [hashtable]::Synchronized(@{
             Running = $true; IntervalMs = $IntervalMs; WatchProcesses = $WatchProcesses
             WatchForeground = $WatchForeground; WatchPrograms = $WatchPrograms; WatchFiles = $WatchFiles
+            UseFsWatcher = $UseFsWatcher; WatchServices = $WatchServices
+            WatchScheduledTasks = $WatchScheduledTasks; WatchRunKeys = $WatchRunKeys
             ScanEveryTicks = $ScanEveryTicks; WatchDirs = @($WatchDirs)
             MaxId = 0; Error = $null; StartedAt = (Get-Date).ToString("o")
         })
@@ -3078,9 +3208,13 @@ function Invoke-AgentCommand {
             $watchForeground = [bool](Get-ArgValue $args "watchForeground" $true)
             $watchPrograms = [bool](Get-ArgValue $args "watchPrograms" $true)
             $watchFiles = [bool](Get-ArgValue $args "watchFiles" $true)
+            $useFsWatcher = [bool](Get-ArgValue $args "useFsWatcher" $true)
+            $watchServices = [bool](Get-ArgValue $args "watchServices" $true)
+            $watchScheduledTasks = [bool](Get-ArgValue $args "watchScheduledTasks" $true)
+            $watchRunKeys = [bool](Get-ArgValue $args "watchRunKeys" $true)
             $scanEveryTicks = [int](Get-ArgValue $args "scanEveryTicks" 5)
             $watchDirs = @(Get-ArgValue $args "watchDirs" @())
-            return @{ data = (Start-SandboxWatcher -IntervalMs $intervalMs -WatchProcesses $watchProcesses -WatchForeground $watchForeground -WatchPrograms $watchPrograms -WatchFiles $watchFiles -ScanEveryTicks $scanEveryTicks -WatchDirs $watchDirs) }
+            return @{ data = (Start-SandboxWatcher -IntervalMs $intervalMs -WatchProcesses $watchProcesses -WatchForeground $watchForeground -WatchPrograms $watchPrograms -WatchFiles $watchFiles -UseFsWatcher $useFsWatcher -WatchServices $watchServices -WatchScheduledTasks $watchScheduledTasks -WatchRunKeys $watchRunKeys -ScanEveryTicks $scanEveryTicks -WatchDirs $watchDirs) }
         }
         "watch_stop" {
             return @{ data = (Stop-SandboxWatcher) }

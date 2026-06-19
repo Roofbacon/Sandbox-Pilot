@@ -91,9 +91,21 @@ test("the event bus auto-starts and emits program/file events with a generalized
   assert.match(serverSrc, /"sandbox_wait_for_event"/);
 });
 
-test("server and guest version are bumped to 0.5.0 so a stale agent is visible", () => {
-  assert.match(serverSrc, /SERVER_VERSION\s*=\s*"0\.5\.0"/);
-  assert.match(guestSrc, /\$AgentVersion\s*=\s*"0\.5\.0"/);
+test("server and guest version are bumped to 0.6.0 so a stale agent is visible", () => {
+  assert.match(serverSrc, /SERVER_VERSION\s*=\s*"0\.6\.0"/);
+  assert.match(guestSrc, /\$AgentVersion\s*=\s*"0\.6\.0"/);
+});
+
+test("0.6.0-D: deeper watcher (real-time files + services/tasks/autoruns)", () => {
+  // Real-time recursive file watcher via a thread-safe C# helper.
+  assert.match(guestSrc, /class SbxFsMonitor/);
+  assert.match(guestSrc, /IncludeSubdirectories\s*=\s*true/);
+  // New change sources are emitted and exposed to wait_for_event.
+  for (const ev of ["serviceInstalled", "scheduledTaskAdded", "autorunAdded"]) {
+    assert.match(guestSrc, new RegExp(`"${ev}"`), `guest emits ${ev}`);
+    assert.match(serverSrc, new RegExp(`"${ev}"`), `wait_for_event lists ${ev}`);
+  }
+  assert.match(serverSrc, /watchRunKeys/);
 });
 
 test("0.5.0-C: numeric progress + generic job streaming", () => {
