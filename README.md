@@ -33,10 +33,15 @@ Sandbox Pilot exposes [Windows Sandbox](https://learn.microsoft.com/en-us/window
 | **Test** | `sandbox_assert` (file/registry/process/service/window/installedProgram/msiProductCode/script pass-fail checks), `sandbox_run_test_plan` - run a declarative step list and emit JUnit XML + a screenshot-embedded Markdown report |
 | **Snapshot / diff** | `sandbox_snapshot`, `sandbox_diff_snapshots` - baseline files/registry/programs/services, then diff before vs after to see exactly what an installer changed (footprint docs + uninstall-residue checks) |
 | **Diagnostics** | `sandbox_event_logs` - collect Application/System event-log entries (Critical/Error/Warning + MsiInstaller) for a time window; `sandbox_test_install_command` also captures them around the install window |
-| **Intune packaging** | `sandbox_intune_prereqs`, `sandbox_intune_package_win32`, `sandbox_intune_package_from_host` - test install, verify detection, test uninstall, auto-install Microsoft's Win32 Content Prep Tool if needed, and save `.intunewin` packages to shared artifacts |
+| **Intune packaging** | `sandbox_test_intune_deployment`, `sandbox_build_packaging_dossier`, `sandbox_intune_prereqs`, `sandbox_intune_package_win32`, `sandbox_intune_package_from_host` - run an IME-style install/uninstall simulation, verify detection, build a packaging dossier, auto-install Microsoft's Win32 Content Prep Tool if needed, and save `.intunewin` packages to shared artifacts |
 | **Long jobs** | `sandbox_start_job`, `sandbox_job_status`, `sandbox_job_cancel` - run long PowerShell operations without blocking the MCP call, with persisted stdout/stderr artifacts |
 | **Document** | `sandbox_annotate` (boxes/arrows/labels/spotlight/**redact**), `sandbox_record_start` + `sandbox_record_stop` (auto-capture a step per action), `sandbox_guide_step` + `sandbox_guide_build` (Markdown/HTML/PDF) + `sandbox_guide_reset` |
 | **Lifecycle** | `sandbox_prepare` (one call to a control-ready Sandbox; `fresh=true` to force a clean boot), `sandbox_stop` (reset — destroy the VM), `sandbox_status`, `sandbox_cleanup` (prune old run artifacts) |
+
+Sandbox Pilot also exposes MCP prompts/resources for common workflows:
+`intune_package_app_from_folder`, `silent_install_test_workflow`, `user_guide_creation_workflow`,
+`sandbox-pilot://workflows/intune-packaging`, `sandbox-pilot://workflows/user-guide`, and
+`sandbox-pilot://schemas/detection-rule`.
 
 > **Agent compatibility.** The guest agent reports a version and wire-protocol number; `sandbox_health` compares them against the server's and returns a `compatibility` block. If it carries a `warning`, the agent in the Sandbox is stale — redeploy it with `host\SandboxBridge.ps1 reload-agent`. Run artifacts (job logs, test-plan runs, snapshots, screenshots) accumulate in the shared bridge; `sandbox_cleanup` prunes them by age/count (recorded guides are left alone unless you opt in).
 
@@ -205,6 +210,10 @@ For operations that may outlive a normal MCP tool call, use `sandbox_start_job` 
 The same diff doubles as an **uninstall-residue check**: snapshot a clean baseline, install, uninstall, snapshot again, and diff the post-uninstall state against the clean baseline — anything left behind shows up as added files/keys/services. The footprint diff is also useful documentation in its own right ("installing X creates these files and this service"). Both file roots and registry roots are overridable for targeted snapshots.
 
 ## Intune packaging workflow
+
+For a normal packaging proof, start with `sandbox_test_intune_deployment`. It stages a host source folder into an isolated IME-like content cache, runs the install command from that working directory, supports `system` or user-context execution and x64/x86 PowerShell, collects event logs and blocking UI evidence, verifies the detection rule after install, runs uninstall, verifies the rule is absent, attaches footprint/residue diffs, and can write a Markdown/JSON dossier in one call.
+
+Use `sandbox_build_packaging_dossier` when you already have deployment/package evidence and want a handoff document. The dossier records commands, detection rule, verdict, warnings, package hashes, source manifest, footprint, residue, and artifact paths under `bridge\artifacts\dossiers`.
 
 For a normal host folder, prefer `sandbox_intune_package_from_host`. It stages the host source folder, tests the install command from that staged source directory by default, verifies the detection rule, tests the uninstall command when one is available, verifies the detection rule is absent afterward, then runs packaging inside the Sandbox only after the smoke test succeeds. It returns host paths for the generated `.intunewin` packages, avoiding any need to know where the bridge folder lives.
 

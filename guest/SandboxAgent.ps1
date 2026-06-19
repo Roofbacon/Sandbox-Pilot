@@ -28,7 +28,7 @@ $AgentCommands = @(
     "watch_start", "watch_stop", "watch_poll", "watch_wait", "wait_for_event",
     "job_start_ps", "job_status", "job_cancel",
     "winget_bootstrap", "winget", "winget_start", "winget_status",
-    "intune_prereqs", "intune_package",
+    "intune_prereqs", "intune_package", "intune_ime_simulate",
     "processes", "screen_info", "stop_agent"
 )
 
@@ -968,6 +968,170 @@ function Wait-SandboxWatcherEvent {
     return (Wait-SandboxEvent -TimeoutMs $TimeoutMs -PollMs $PollMs -Types @($Type | Where-Object { $_ }) -Contains $Contains -SinceId $SinceId)
 }
 
+function Resolve-PowerShellExecutable {
+    param([string]$Architecture = "x64")
+
+    $arch = $Architecture.ToLowerInvariant()
+    $sysRoot = $env:WINDIR
+    if (-not $sysRoot) { $sysRoot = "C:\Windows" }
+    $x86 = Join-Path $sysRoot "SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
+    $x64 = Join-Path $sysRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    if ($arch -eq "x86" -and (Test-Path -LiteralPath $x86)) { return $x86 }
+    if (Test-Path -LiteralPath $x64) { return $x64 }
+    return "powershell.exe"
+}
+
+function Invoke-ScheduledSystemCommandTest {
+    param(
+        [string]$Command,
+        [int]$TimeoutMs = 120000,
+        [string]$LogPath = "",
+        [int]$LogTailLines = 80,
+        [string]$WorkingDirectory = "",
+        [bool]$CollectEventLogs = $false,
+        [int]$EventLogBufferSeconds = 5,
+        [int]$EventLogMaxEvents = 200,
+        [bool]$WatchWindows = $true,
+        [string]$PowerShellArchitecture = "x64"
+    )
+
+    if (-not $Command) { throw "Command is required." }
+    if ($WatchWindows) { [void](Confirm-SandboxWatcher) }
+    if ($WorkingDirectory) {
+        if (-not (Test-Path -LiteralPath $WorkingDirectory)) { throw "workingDirectory does not exist: $WorkingDirectory" }
+        $WorkingDirectory = (Resolve-Path -LiteralPath $WorkingDirectory).Path
+    }
+
+    $started = Get-Date
+    $beforePrograms = @(Get-InstalledPrograms)
+    $runId = "system-command-$((Get-Date).ToString('yyyyMMdd-HHmmss'))-$(([guid]::NewGuid().ToString()).Substring(0,8))"
+    $runDir = Join-Path $JobsDir $runId
+    New-Item -ItemType Directory -Force -Path $runDir | Out-Null
+    $wrapperPath = Join-Path $runDir "command.ps1"
+    $resultPath = Join-Path $runDir "result.json"
+    $transcriptPath = Join-Path $runDir "transcript.log"
+    $stderrPath = Join-Path $runDir "stderr.log"
+    $psPath = Resolve-PowerShellExecutable -Architecture $PowerShellArchitecture
+
+    $wdLiteral = "'" + ($WorkingDirectory -replace "'", "''") + "'"
+    $resultLiteral = "'" + ($resultPath -replace "'", "''") + "'"
+    $transcriptLiteral = "'" + ($transcriptPath -replace "'", "''") + "'"
+    $stderrLiteral = "'" + ($stderrPath -replace "'", "''") + "'"
+    $script = @"
+`$ErrorActionPreference = 'Continue'
+`$ProgressPreference = 'SilentlyContinue'
+`$started = Get-Date
+`$exitCode = 0
+try {
+    if ($wdLiteral -ne '') { Set-Location -LiteralPath $wdLiteral }
+    try { Start-Transcript -Path $transcriptLiteral -Force | Out-Null } catch { }
+    try {
+        & {
+$Command
+        }
+        if (`$null -ne `$global:LASTEXITCODE) { `$exitCode = [int]`$global:LASTEXITCODE } else { `$exitCode = 0 }
+    }
+    catch {
+        Write-Error (`$_ | Out-String)
+        `$exitCode = 1
+    }
+}
+catch {
+    (`$_ | Out-String) | Set-Content -LiteralPath $stderrLiteral -Encoding UTF8
+    `$exitCode = 1
+}
+finally {
+    try { Stop-Transcript | Out-Null } catch { }
+    [ordered]@{
+        startedAt = `$started.ToString('o')
+        finishedAt = (Get-Date).ToString('o')
+        exitCode = `$exitCode
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $resultLiteral -Encoding UTF8
+}
+exit `$exitCode
+"@
+    [System.IO.File]::WriteAllText($wrapperPath, $script, (New-Object System.Text.UTF8Encoding($false)))
+
+    $taskName = "SandboxPilot-IME-$(([guid]::NewGuid().ToString()).Substring(0,8))"
+    $action = New-ScheduledTaskAction -Execute $psPath -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$wrapperPath`""
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5)
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+    Start-ScheduledTask -TaskName $taskName
+
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    $timedOut = $false
+    while (-not (Test-Path -LiteralPath $resultPath)) {
+        if ((Get-Date) -ge $deadline) {
+            $timedOut = $true
+            try { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } catch { }
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+
+    $result = $null
+    if (Test-Path -LiteralPath $resultPath) {
+        try { $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json } catch { }
+    }
+    $stdout = ""
+    $stderr = ""
+    if (Test-Path -LiteralPath $transcriptPath) { $stdout = Get-Content -LiteralPath $transcriptPath -Raw -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $stderrPath) { $stderr = Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue }
+
+    $afterPrograms = @(Get-InstalledPrograms)
+    $beforeKeys = @{}
+    foreach ($p in $beforePrograms) { $beforeKeys["$($p.name)|$($p.version)|$($p.publisher)"] = $true }
+    $newPrograms = @($afterPrograms | Where-Object { -not $beforeKeys.ContainsKey("$($_.name)|$($_.version)|$($_.publisher)") })
+
+    $logs = @()
+    if ($LogPath) {
+        $tail = Get-LogTail -Path $LogPath -TailLines $LogTailLines
+        if ($tail) { $logs += $tail }
+    }
+
+    $eventLogs = $null
+    if ($CollectEventLogs) {
+        $eventLogs = Get-EventLogWindow -StartTime $started.AddSeconds(-$EventLogBufferSeconds) -EndTime (Get-Date) -MaxEvents $EventLogMaxEvents
+    }
+
+    $windowsDuringRun = @()
+    if ($WatchWindows -and $script:WatchEvents) {
+        $startIso = $started.ToString("o")
+        $windowsDuringRun = @($script:WatchEvents.ToArray() |
+                Where-Object { $_.type -eq "windowOpened" -and ([string]$_.at) -ge $startIso } |
+                Select-Object -ExpandProperty value -Unique)
+    }
+
+    return [ordered]@{
+        command = $Command
+        startedAt = $(if ($result) { $result.startedAt } else { $started.ToString("o") })
+        finishedAt = $(if ($result) { $result.finishedAt } else { (Get-Date).ToString("o") })
+        timedOut = $timedOut
+        timeoutMs = $TimeoutMs
+        workingDirectory = $WorkingDirectory
+        pid = $null
+        exitCode = $(if ($result -and $null -ne $result.exitCode) { [int]$result.exitCode } else { $null })
+        stdout = $stdout
+        stderr = $stderr
+        newPrograms = @($newPrograms)
+        visibleWindows = @(Get-TopLevelWindows)
+        windowsDuringRun = @($windowsDuringRun)
+        pendingReboot = $false
+        logs = @($logs)
+        eventLogs = $eventLogs
+        runAs = "system"
+        architecture = $PowerShellArchitecture
+        powerShellPath = $psPath
+        artifacts = [ordered]@{
+            dir = $runDir
+            transcript = $transcriptPath
+            result = $resultPath
+        }
+    }
+}
+
 function Wait-SandboxEvent {
     # Block until a system event matches the predicate, or a timeout elapses. This is what replaces
     # "sleep N seconds and hope": the agent names what it is waiting for (a process exiting, a
@@ -1013,10 +1177,19 @@ function Invoke-InstallerCommandTest {
         [bool]$CollectEventLogs = $false,
         [int]$EventLogBufferSeconds = 5,
         [int]$EventLogMaxEvents = 200,
-        [bool]$WatchWindows = $true
+        [bool]$WatchWindows = $true,
+        [string]$RunAs = "adminUser",
+        [string]$PowerShellArchitecture = "x64"
     )
 
     if (-not $Command) { throw "Command is required." }
+    $runAsNormalized = $RunAs.ToLowerInvariant()
+    if ($runAsNormalized -eq "system") {
+        return Invoke-ScheduledSystemCommandTest -Command $Command -TimeoutMs $TimeoutMs -LogPath $LogPath -LogTailLines $LogTailLines -WorkingDirectory $WorkingDirectory -CollectEventLogs $CollectEventLogs -EventLogBufferSeconds $EventLogBufferSeconds -EventLogMaxEvents $EventLogMaxEvents -WatchWindows $WatchWindows -PowerShellArchitecture $PowerShellArchitecture
+    }
+    if (@("adminuser", "currentuser", "user") -notcontains $runAsNormalized) {
+        throw "Unsupported runAs '$RunAs'. Use system, adminUser, currentUser, or user."
+    }
     # Make sure the screen watcher is live before the command runs, so any window the command pops
     # (e.g. a modal installer/error dialog the silent switches did not suppress) is captured.
     if ($WatchWindows) { [void](Confirm-SandboxWatcher) }
@@ -1025,7 +1198,8 @@ function Invoke-InstallerCommandTest {
     $wrappedCommand = '$ProgressPreference = "SilentlyContinue"; & { ' + $Command + ' }; if ($null -ne $global:LASTEXITCODE) { exit $global:LASTEXITCODE }'
     $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($wrappedCommand))
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = "powershell.exe"
+    $powerShellPath = Resolve-PowerShellExecutable -Architecture $PowerShellArchitecture
+    $psi.FileName = $powerShellPath
     $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded"
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
@@ -1125,6 +1299,10 @@ function Invoke-InstallerCommandTest {
         pendingReboot = $pendingReboot
         logs = @($logs)
         eventLogs = $eventLogs
+        runAs = $(if ($runAsNormalized -eq "user") { "currentUser" } else { $RunAs })
+        architecture = $PowerShellArchitecture
+        powerShellPath = $powerShellPath
+        warning = $(if ($runAsNormalized -eq "user") { "The Sandbox does not create a separate standard user for this mode; command ran as the current sandbox user." } else { $null })
     }
 }
 
@@ -2489,6 +2667,215 @@ function New-SystemSnapshot {
     }
 }
 
+function Test-IntuneExitCode {
+    param($CommandResult, [int[]]$ExpectedExitCodes)
+
+    if (-not $CommandResult) { return $false }
+    if ($CommandResult.timedOut) { return $false }
+    if ($null -eq $CommandResult.exitCode) { return $false }
+    return ($ExpectedExitCodes -contains [int]$CommandResult.exitCode)
+}
+
+function Get-BlockingInstallerWindows {
+    param($CommandResult)
+
+    $rx = [regex]::new("(?i)\b(error|failed|failure|warning|wizard|setup|installer|license|eula|restart|reboot|prompt|choose|browse|complete)\b")
+    return @($CommandResult.windowsDuringRun | Where-Object { $rx.IsMatch([string]$_) } | Select-Object -Unique)
+}
+
+function ConvertTo-CommandEvidenceSummary {
+    param($CommandResult, [string]$ArtifactPath = "")
+
+    if (-not $CommandResult) { return $null }
+    $summary = [ordered]@{
+        command = Get-ObjectPropertyValue -Object $CommandResult -Name "command" ""
+        startedAt = Get-ObjectPropertyValue -Object $CommandResult -Name "startedAt" ""
+        finishedAt = Get-ObjectPropertyValue -Object $CommandResult -Name "finishedAt" ""
+        timedOut = [bool](Get-ObjectPropertyValue -Object $CommandResult -Name "timedOut" $false)
+        timeoutMs = Get-ObjectPropertyValue -Object $CommandResult -Name "timeoutMs" $null
+        workingDirectory = Get-ObjectPropertyValue -Object $CommandResult -Name "workingDirectory" ""
+        exitCode = Get-ObjectPropertyValue -Object $CommandResult -Name "exitCode" $null
+        runAs = Get-ObjectPropertyValue -Object $CommandResult -Name "runAs" ""
+        architecture = Get-ObjectPropertyValue -Object $CommandResult -Name "architecture" ""
+        powerShellPath = Get-ObjectPropertyValue -Object $CommandResult -Name "powerShellPath" ""
+        pendingReboot = [bool](Get-ObjectPropertyValue -Object $CommandResult -Name "pendingReboot" $false)
+        newPrograms = @(Get-ObjectPropertyValue -Object $CommandResult -Name "newPrograms" @())
+        visibleWindows = @(Get-ObjectPropertyValue -Object $CommandResult -Name "visibleWindows" @())
+        windowsDuringRun = @(Get-ObjectPropertyValue -Object $CommandResult -Name "windowsDuringRun" @())
+        eventLogCount = Get-ObjectPropertyValue -Object (Get-ObjectPropertyValue -Object $CommandResult -Name "eventLogs" $null) -Name "count" $null
+        artifact = $ArtifactPath
+    }
+    if ($ArtifactPath) {
+        try { Write-Utf8JsonFile -Path $ArtifactPath -Value $summary -Depth 8 } catch { }
+    }
+    return $summary
+}
+
+function Invoke-IntuneImeSimulation {
+    param(
+        [string]$SourceFolder,
+        [string]$InstallCommand,
+        [string]$UninstallCommand = "",
+        $DetectionRule = $null,
+        [string]$InstallContext = "system",
+        [string]$Architecture = "x64",
+        [int]$InstallTimeoutMs = 1800000,
+        [int]$UninstallTimeoutMs = 900000,
+        [int[]]$ExpectedInstallExitCodes = @(0, 1707, 3010, 1641),
+        [int[]]$ExpectedUninstallExitCodes = @(0, 1605, 1707, 3010, 1641),
+        [bool]$VerifyDetection = $true,
+        [bool]$TestUninstall = $true,
+        [bool]$CollectEventLogs = $true,
+        [bool]$IncludeSnapshots = $true,
+        [bool]$IncludeFiles = $false
+    )
+
+    if (-not $SourceFolder) { throw "sourceFolder is required." }
+    if (-not (Test-Path -LiteralPath $SourceFolder)) { throw "sourceFolder does not exist: $SourceFolder" }
+    if (-not $InstallCommand) { throw "installCommand is required." }
+    if (@("system", "adminUser", "currentUser", "user") -notcontains $InstallContext) { throw "installContext must be system, adminUser, currentUser, or user." }
+    if (@("x64", "x86") -notcontains $Architecture) { throw "architecture must be x64 or x86." }
+
+    $resolvedSource = (Resolve-Path -LiteralPath $SourceFolder).Path
+    $runId = "ime-$((Get-Date).ToString('yyyyMMdd-HHmmss'))-$(([guid]::NewGuid().ToString()).Substring(0,8))"
+    $runRoot = Join-Path $IntuneArtifactsDir $runId
+    $contentRoot = Join-Path $runRoot "Content"
+    $installEvidencePath = Join-Path $runRoot "install-result.json"
+    $uninstallEvidencePath = Join-Path $runRoot "uninstall-result.json"
+    New-Item -ItemType Directory -Force -Path $contentRoot | Out-Null
+    Get-ChildItem -LiteralPath $resolvedSource -Force -ErrorAction SilentlyContinue |
+        ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $contentRoot -Recurse -Force }
+
+    $warnings = New-Object System.Collections.ArrayList
+    if ($InstallContext -eq "user") {
+        [void]$warnings.Add("installContext=user runs as the current sandbox user; Sandbox Pilot does not create a separate non-admin user profile.")
+    }
+
+    $snapBefore = $null
+    $snapAfterInstall = $null
+    $snapAfterUninstall = $null
+    if ($IncludeSnapshots) {
+        $snapBefore = New-SystemSnapshot -Label "ime-before-install" -IncludeFiles $IncludeFiles -IncludeRegistry $true -IncludePrograms $true -IncludeServices $true
+    }
+
+    $install = Invoke-InstallerCommandTest -Command $InstallCommand -TimeoutMs $InstallTimeoutMs -WorkingDirectory $contentRoot -CollectEventLogs $CollectEventLogs -RunAs $InstallContext -PowerShellArchitecture $Architecture
+    $installSummary = ConvertTo-CommandEvidenceSummary -CommandResult $install -ArtifactPath $installEvidencePath
+    $installWarning = Get-ObjectPropertyValue -Object $install -Name "warning" ""
+    if ($installWarning) { [void]$warnings.Add($installWarning) }
+    $installExitOk = Test-IntuneExitCode -CommandResult $install -ExpectedExitCodes $ExpectedInstallExitCodes
+    $installBlockingWindows = @(Get-BlockingInstallerWindows -CommandResult $install)
+    if (@($installBlockingWindows).Count -gt 0) {
+        [void]$warnings.Add("Potential blocking or non-silent installer UI was observed during install: $($installBlockingWindows -join '; ')")
+    }
+
+    if ($IncludeSnapshots) {
+        $snapAfterInstall = New-SystemSnapshot -Label "ime-after-install" -IncludeFiles $IncludeFiles -IncludeRegistry $true -IncludePrograms $true -IncludeServices $true
+    }
+
+    $detectionAfterInstall = $null
+    if ($VerifyDetection) {
+        $detectionAfterInstall = Test-PackagingDetectionRule -Rule $DetectionRule -ExpectedPresent $true
+    }
+    else {
+        $detectionAfterInstall = [ordered]@{ skipped = $true; passed = $true; reason = "verifyDetection was set to false."; expectedPresent = $true }
+    }
+
+    $uninstall = $null
+    $uninstallSummary = $null
+    $detectionAfterUninstall = $null
+    $uninstallExitOk = $true
+    if ($TestUninstall) {
+        if (-not $UninstallCommand) {
+            $uninstall = [ordered]@{ skipped = $true; passed = $false; reason = "No uninstallCommand was supplied."; expectedExitCodes = @($ExpectedUninstallExitCodes) }
+            $uninstallExitOk = $false
+        }
+        elseif (-not $installExitOk) {
+            $uninstall = [ordered]@{ skipped = $true; passed = $false; reason = "Install did not return an expected Intune exit code, so uninstall was skipped."; expectedExitCodes = @($ExpectedUninstallExitCodes) }
+            $uninstallExitOk = $false
+        }
+        else {
+            $uninstall = Invoke-InstallerCommandTest -Command $UninstallCommand -TimeoutMs $UninstallTimeoutMs -WorkingDirectory $contentRoot -CollectEventLogs $CollectEventLogs -RunAs $InstallContext -PowerShellArchitecture $Architecture
+            $uninstallSummary = ConvertTo-CommandEvidenceSummary -CommandResult $uninstall -ArtifactPath $uninstallEvidencePath
+            $uninstallWarning = Get-ObjectPropertyValue -Object $uninstall -Name "warning" ""
+            if ($uninstallWarning) { [void]$warnings.Add($uninstallWarning) }
+            $uninstallExitOk = Test-IntuneExitCode -CommandResult $uninstall -ExpectedExitCodes $ExpectedUninstallExitCodes
+            $uninstallBlockingWindows = @(Get-BlockingInstallerWindows -CommandResult $uninstall)
+            if (@($uninstallBlockingWindows).Count -gt 0) {
+                [void]$warnings.Add("Potential blocking or non-silent installer UI was observed during uninstall: $($uninstallBlockingWindows -join '; ')")
+            }
+        }
+
+        if ($IncludeSnapshots) {
+            $snapAfterUninstall = New-SystemSnapshot -Label "ime-after-uninstall" -IncludeFiles $IncludeFiles -IncludeRegistry $true -IncludePrograms $true -IncludeServices $true
+        }
+
+        if ($VerifyDetection) {
+            $detectionAfterUninstall = Test-PackagingDetectionRule -Rule $DetectionRule -ExpectedPresent $false
+        }
+        else {
+            $detectionAfterUninstall = [ordered]@{ skipped = $true; passed = $true; reason = "verifyDetection was set to false."; expectedPresent = $false }
+        }
+    }
+    else {
+        $uninstall = [ordered]@{ skipped = $true; passed = $true; reason = "testUninstall was set to false." }
+        $detectionAfterUninstall = [ordered]@{ skipped = $true; passed = $true; reason = "testUninstall was set to false." }
+    }
+
+    $detectionInstallOk = (-not $VerifyDetection) -or ($detectionAfterInstall -and $detectionAfterInstall.passed)
+    $detectionUninstallOk = (-not $VerifyDetection) -or (-not $TestUninstall) -or ($detectionAfterUninstall -and $detectionAfterUninstall.passed)
+    $passed = $installExitOk -and $detectionInstallOk -and $uninstallExitOk -and $detectionUninstallOk
+
+    $failures = New-Object System.Collections.ArrayList
+    if (-not $installExitOk) { [void]$failures.Add("install exit code $($install.exitCode) was not in expected set $($ExpectedInstallExitCodes -join ', ')") }
+    if (-not $detectionInstallOk) { [void]$failures.Add("detection rule did not match after install") }
+    if (-not $uninstallExitOk) { [void]$failures.Add("uninstall did not return an expected exit code") }
+    if (-not $detectionUninstallOk) { [void]$failures.Add("detection rule still matched after uninstall") }
+
+    return [ordered]@{
+        runId = $runId
+        verdict = $(if ($passed) { "passed" } else { "failed" })
+        passed = $passed
+        failures = @($failures)
+        warnings = @($warnings)
+        context = [ordered]@{
+            installContext = $InstallContext
+            architecture = $Architecture
+            expectedInstallExitCodes = @($ExpectedInstallExitCodes)
+            expectedUninstallExitCodes = @($ExpectedUninstallExitCodes)
+            imeLikeCache = $contentRoot
+        }
+        source = [ordered]@{
+            originalFolder = $resolvedSource
+            stagedContentFolder = $contentRoot
+        }
+        install = [ordered]@{
+            passed = $installExitOk
+            expectedExitCodes = @($ExpectedInstallExitCodes)
+            result = $installSummary
+            blockingWindows = @($installBlockingWindows)
+        }
+        detectionAfterInstall = $detectionAfterInstall
+        uninstall = [ordered]@{
+            passed = $uninstallExitOk
+            expectedExitCodes = @($ExpectedUninstallExitCodes)
+            result = $(if ($uninstallSummary) { $uninstallSummary } else { $uninstall })
+        }
+        detectionAfterUninstall = $detectionAfterUninstall
+        snapshots = [ordered]@{
+            beforeInstall = $snapBefore
+            afterInstall = $snapAfterInstall
+            afterUninstall = $snapAfterUninstall
+        }
+        paths = [ordered]@{
+            root = $runRoot
+            cache = $contentRoot
+            installResult = $installEvidencePath
+            uninstallResult = $(if ($uninstallSummary) { $uninstallEvidencePath } else { $null })
+            bridgeRelativePath = ConvertTo-BridgeRelativePath -Path $runRoot
+        }
+    }
+}
+
 function Test-PackagingDetectionRule {
     param(
         $Rule,
@@ -3178,7 +3565,9 @@ function Invoke-AgentCommand {
             $workingDirectory = [string](Get-ArgValue $args "workingDirectory" "")
             $collectEventLogs = [bool](Get-ArgValue $args "collectEventLogs" $false)
             $eventLogMaxEvents = [int](Get-ArgValue $args "eventLogMaxEvents" 200)
-            return @{ data = (Invoke-InstallerCommandTest -Command $command -TimeoutMs $timeoutMs -LogPath $logPath -LogTailLines $logTailLines -WorkingDirectory $workingDirectory -CollectEventLogs $collectEventLogs -EventLogMaxEvents $eventLogMaxEvents) }
+            $runAs = [string](Get-ArgValue $args "runAs" "adminUser")
+            $architecture = [string](Get-ArgValue $args "architecture" "x64")
+            return @{ data = (Invoke-InstallerCommandTest -Command $command -TimeoutMs $timeoutMs -LogPath $logPath -LogTailLines $logTailLines -WorkingDirectory $workingDirectory -CollectEventLogs $collectEventLogs -EventLogMaxEvents $eventLogMaxEvents -RunAs $runAs -PowerShellArchitecture $architecture) }
         }
         "event_logs" {
             $lastMinutes = [int](Get-ArgValue $args "lastMinutes" 5)
@@ -3337,6 +3726,24 @@ function Invoke-AgentCommand {
             $testUninstall = [bool](Get-ArgValue $args "testUninstall" $true)
             $uninstallTestTimeoutMs = [int](Get-ArgValue $args "uninstallTestTimeoutMs" 90000)
             return @{ data = (Invoke-IntuneWin32Package -SourceFolder $sourceFolder -SetupFile $setupFile -OutputFolder $outputFolder -InstallCommand $installCommand -UninstallCommand $uninstallCommand -DetectionRule $detectionRule -ToolPath $toolPath -EnsureTool $ensureTool -DownloadUrl $downloadUrl -Quiet $quiet -IncludeCatalog $includeCatalog -TimeoutMs $timeoutMs -TestInstall $testInstall -InstallTestTimeoutMs $installTestTimeoutMs -VerifyDetection $verifyDetection -TestUninstall $testUninstall -UninstallTestTimeoutMs $uninstallTestTimeoutMs) }
+        }
+        "intune_ime_simulate" {
+            $sourceFolder = [string](Get-ArgValue $args "sourceFolder" "")
+            $installCommand = [string](Get-ArgValue $args "installCommand" "")
+            $uninstallCommand = [string](Get-ArgValue $args "uninstallCommand" "")
+            $detectionRule = Get-ArgValue $args "detectionRule" $null
+            $installContext = [string](Get-ArgValue $args "installContext" "system")
+            $architecture = [string](Get-ArgValue $args "architecture" "x64")
+            $installTimeoutMs = [int](Get-ArgValue $args "installTimeoutMs" 1800000)
+            $uninstallTimeoutMs = [int](Get-ArgValue $args "uninstallTimeoutMs" 900000)
+            $expectedInstallExitCodes = [int[]]@(Get-ArgValue $args "expectedInstallExitCodes" @(0, 1707, 3010, 1641))
+            $expectedUninstallExitCodes = [int[]]@(Get-ArgValue $args "expectedUninstallExitCodes" @(0, 1605, 1707, 3010, 1641))
+            $verifyDetection = [bool](Get-ArgValue $args "verifyDetection" $true)
+            $testUninstall = [bool](Get-ArgValue $args "testUninstall" $true)
+            $collectEventLogs = [bool](Get-ArgValue $args "collectEventLogs" $true)
+            $includeSnapshots = [bool](Get-ArgValue $args "includeSnapshots" $true)
+            $includeFiles = [bool](Get-ArgValue $args "includeFiles" $false)
+            return @{ data = (Invoke-IntuneImeSimulation -SourceFolder $sourceFolder -InstallCommand $installCommand -UninstallCommand $uninstallCommand -DetectionRule $detectionRule -InstallContext $installContext -Architecture $architecture -InstallTimeoutMs $installTimeoutMs -UninstallTimeoutMs $uninstallTimeoutMs -ExpectedInstallExitCodes $expectedInstallExitCodes -ExpectedUninstallExitCodes $expectedUninstallExitCodes -VerifyDetection $verifyDetection -TestUninstall $testUninstall -CollectEventLogs $collectEventLogs -IncludeSnapshots $includeSnapshots -IncludeFiles $includeFiles) }
         }
         "processes" {
             $processes = Get-Process |

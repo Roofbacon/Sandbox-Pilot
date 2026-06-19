@@ -11,6 +11,7 @@ import { runTestPlan } from "./testplan.js";
 import { diffSnapshots } from "./snapshot.js";
 import { buildGuideDocs } from "./guidedoc.js";
 import { cleanupArtifacts } from "./cleanup.js";
+import { buildPackagingDossier } from "./dossier.js";
 
 // Transport: "socket" (low latency, guest listens / host connects out) or the default
 // file bridge (shared folder; simpler but ~20s host->guest propagation).
@@ -31,6 +32,133 @@ const server = new McpServer({
 const text = (value: unknown) => ({
   content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
 });
+
+const workflowResources: Record<string, { title: string; description: string; text: string }> = {
+  "sandbox-pilot://workflows/intune-packaging": {
+    title: "Intune Packaging Workflow",
+    description: "Recommended end-to-end workflow for proving and packaging a Win32 app.",
+    text:
+      "# Intune Packaging Workflow\n\n" +
+      "1. Call sandbox_prepare with fresh=true when clean state matters.\n" +
+      "2. Use sandbox_find_install_candidates or sandbox_analyze_installers to identify setup technology and silent commands.\n" +
+      "3. Call sandbox_test_intune_deployment with sourceHostFolder, installCommand, uninstallCommand, detectionRule, installContext=system, and architecture=x64.\n" +
+      "4. Review deployment.verdict, failures, blockingWindows, footprint, and residue before packaging.\n" +
+      "5. Call sandbox_intune_package_from_host only after the IME simulation passes.\n" +
+      "6. Call sandbox_build_packaging_dossier with the deployment and packaging results for the handoff artifact.\n",
+  },
+  "sandbox-pilot://workflows/user-guide": {
+    title: "User Guide Workflow",
+    description: "Recommended workflow for creating a screenshot user guide from a Sandbox run.",
+    text:
+      "# User Guide Workflow\n\n" +
+      "1. Call sandbox_prepare and open the target app or Windows settings page.\n" +
+      "2. Call sandbox_record_start with a descriptive guide name.\n" +
+      "3. Prefer sandbox_ui_tree plus sandbox_invoke for stable actions; use screenshots/OCR only when UIA is empty.\n" +
+      "4. Use sandbox_annotate or sandbox_guide_step for deliberate callouts and redactions.\n" +
+      "5. Call sandbox_record_stop, then sandbox_guide_build with markdown/html/pdf as needed.\n",
+  },
+  "sandbox-pilot://schemas/detection-rule": {
+    title: "Detection Rule Schema",
+    description: "Detection-rule shapes accepted by detection verification and Intune deployment testing.",
+    text:
+      "# Detection Rule Shapes\n\n" +
+      "MSI product code:\n```json\n{\"type\":\"msiProductCode\",\"productCode\":\"{GUID}\",\"productVersion\":\"1.2.3\"}\n```\n\n" +
+      "Registry value or key presence:\n```json\n{\"type\":\"registry\",\"path\":\"HKLM:\\\\Software\\\\...\",\"valueName\":\"DisplayVersion\",\"operator\":\"equals\",\"value\":\"1.2.3\"}\n```\n\n" +
+      "File path/version:\n```json\n{\"type\":\"file\",\"path\":\"C:\\\\Program Files\\\\App\\\\app.exe\",\"version\":\"1.2.3\",\"operator\":\"greaterOrEqual\"}\n```\n\n" +
+      "PowerShell script detection:\n```json\n{\"type\":\"script\",\"script\":\"if (Test-Path 'C:\\\\Program Files\\\\App\\\\app.exe') { exit 0 } else { exit 1 }\"}\n```\n",
+  },
+};
+
+for (const [uri, resource] of Object.entries(workflowResources)) {
+  server.registerResource(
+    uri.split("/").pop() ?? uri,
+    uri,
+    { title: resource.title, description: resource.description, mimeType: "text/markdown" },
+    async (requestUri) => ({
+      contents: [{ uri: requestUri.toString(), mimeType: "text/markdown", text: resource.text }],
+    }),
+  );
+}
+
+server.registerPrompt(
+  "intune_package_app_from_folder",
+  {
+    title: "Package App From Folder",
+    description: "Guide an agent through analysis, IME simulation, packaging, and dossier generation for a Win32 app folder.",
+    argsSchema: {
+      sourceHostFolder: z.string().describe("Host folder containing the source files."),
+      appName: z.string().optional().describe("Friendly app name."),
+      setupFile: z.string().optional().describe("Known setup file, if already identified."),
+    },
+  },
+  async ({ sourceHostFolder, appName, setupFile }) => ({
+    messages: [
+      {
+        role: "user",
+        content: {
+          type: "text",
+          text:
+            `Package ${appName ?? "this app"} for Intune from ${sourceHostFolder}.\n\n` +
+            `${setupFile ? `Known setup file: ${setupFile}\n\n` : ""}` +
+            "Use Sandbox Pilot's workflow: prepare a clean Sandbox, analyze installer candidates, infer or ask for install/uninstall commands, run sandbox_test_intune_deployment as system/x64 with detection verification, package only after the simulation passes, then build a packaging dossier.",
+        },
+      },
+    ],
+  }),
+);
+
+server.registerPrompt(
+  "silent_install_test_workflow",
+  {
+    title: "Silent Install Test",
+    description: "Guide an agent through validating a proposed silent install/uninstall pair.",
+    argsSchema: {
+      sourceHostFolder: z.string().describe("Host folder containing installer source."),
+      installCommand: z.string().describe("Proposed silent install command."),
+      uninstallCommand: z.string().optional().describe("Proposed silent uninstall command."),
+    },
+  },
+  async ({ sourceHostFolder, installCommand, uninstallCommand }) => ({
+    messages: [
+      {
+        role: "user",
+        content: {
+          type: "text",
+          text:
+            `Validate this Intune silent install from ${sourceHostFolder}.\n\n` +
+            `Install command: ${installCommand}\n` +
+            `Uninstall command: ${uninstallCommand ?? "(not supplied)"}\n\n` +
+            "Run sandbox_test_intune_deployment with event-log collection and detection verification when a rule is available. Report exit codes, blocking UI, detection behavior, footprint, residue, and whether it is Intune-ready.",
+        },
+      },
+    ],
+  }),
+);
+
+server.registerPrompt(
+  "user_guide_creation_workflow",
+  {
+    title: "Create User Guide",
+    description: "Guide an agent through recording a screenshot-based user guide in the Sandbox.",
+    argsSchema: {
+      guideName: z.string().describe("Guide artifact name."),
+      task: z.string().describe("Procedure to perform and document."),
+    },
+  },
+  async ({ guideName, task }) => ({
+    messages: [
+      {
+        role: "user",
+        content: {
+          type: "text",
+          text:
+            `Create a user guide named ${guideName} for this task: ${task}\n\n` +
+            "Use sandbox_record_start, drive the UI with UI Automation where possible, add manual annotated/redacted steps when useful, stop recording, and build Markdown plus HTML output.",
+        },
+      },
+    ],
+  }),
+);
 
 function bridgeHostPath(relativePath?: string | null): string | null {
   return toBridgeHostPath(relativePath);
@@ -1352,6 +1480,153 @@ server.registerTool(
     },
   },
   async (args) => text(addBridgeHostPaths((await sendCommand("job_cancel", args, 30000)).data)),
+);
+
+server.registerTool(
+  "sandbox_test_intune_deployment",
+  {
+    title: "Test an Intune-style deployment",
+    description:
+      "Simulate the Intune Management Extension packaging run as closely as a disposable Sandbox allows: " +
+      "copy the source into an isolated IME-like content cache, run the install command from that working " +
+      "directory as SYSTEM or the sandbox user, choose x64/x86 PowerShell, collect event logs and blocking " +
+      "UI evidence, verify detection after install, run uninstall, verify detection is absent, and return " +
+      "one pass/fail verdict. With buildDossier=true it also writes a Markdown/JSON packaging dossier.",
+    inputSchema: {
+      sourceHostFolder: z.string().optional().describe("Host folder containing the app source. Preferred for normal use; it is staged into the Sandbox first."),
+      sourceFolder: z.string().optional().describe("Guest-visible source folder. Use C:\\SandboxBridge\\... paths, not host-only paths."),
+      setupFile: z.string().optional().describe("Optional setup file name for dossier metadata."),
+      appName: z.string().optional().describe("Friendly app name for the dossier and artifact folder."),
+      installCommand: z.string().describe("Intune install command, run from the staged content folder."),
+      uninstallCommand: z.string().optional().describe("Intune uninstall command, run from the staged content folder."),
+      detectionRule: z.any().optional().describe("Intune-style detection rule to verify after install and uninstall."),
+      installContext: z.enum(["system", "adminUser", "currentUser", "user"]).default("system").describe("Execution context to test. Intune Win32 apps usually run as system."),
+      architecture: z.enum(["x64", "x86"]).default("x64").describe("PowerShell host architecture for the command wrapper."),
+      installTimeoutMs: z.number().int().positive().default(1800000).describe("Install timeout, default 30 minutes."),
+      uninstallTimeoutMs: z.number().int().positive().default(900000).describe("Uninstall timeout, default 15 minutes."),
+      expectedInstallExitCodes: z.array(z.number().int()).default([0, 1707, 3010, 1641]).describe("Exit codes Intune should treat as successful for install."),
+      expectedUninstallExitCodes: z.array(z.number().int()).default([0, 1605, 1707, 3010, 1641]).describe("Exit codes Intune should treat as successful for uninstall."),
+      verifyDetection: z.boolean().default(true).describe("Verify detection after install and expected absence after uninstall."),
+      testUninstall: z.boolean().default(true).describe("Run uninstall after a successful install."),
+      collectEventLogs: z.boolean().default(true).describe("Collect Application/System event logs around install and uninstall."),
+      includeSnapshots: z.boolean().default(true).describe("Capture before/after snapshots and attach install footprint/residue diffs."),
+      includeFiles: z.boolean().default(false).describe("Include file scans in snapshots. Slower, but useful for file-based detection and residue."),
+      destinationName: z.string().optional().describe("Optional staging folder name under bridge\\processed when sourceHostFolder is used."),
+      buildDossier: z.boolean().default(true).describe("Write a Markdown/JSON packaging dossier from the test evidence."),
+    },
+  },
+  async (args) => {
+    if (!args.sourceHostFolder && !args.sourceFolder) throw new Error("Provide sourceHostFolder or sourceFolder.");
+    let staged: any = null;
+    let sourceFolder = args.sourceFolder;
+    if (args.sourceHostFolder) {
+      staged = await stageHostPath({
+        hostPath: args.sourceHostFolder,
+        destinationName: args.destinationName,
+        overwrite: true,
+      });
+      sourceFolder = staged.guestPath;
+    } else {
+      await assertNoHostOnlyGuestPath(sourceFolder, "sourceFolder");
+    }
+
+    const deployment = addBridgeHostPaths(
+      (
+        await sendCommand(
+          "intune_ime_simulate",
+          {
+            sourceFolder,
+            installCommand: args.installCommand,
+            uninstallCommand: args.uninstallCommand,
+            detectionRule: args.detectionRule,
+            installContext: args.installContext,
+            architecture: args.architecture,
+            installTimeoutMs: args.installTimeoutMs,
+            uninstallTimeoutMs: args.uninstallTimeoutMs,
+            expectedInstallExitCodes: args.expectedInstallExitCodes,
+            expectedUninstallExitCodes: args.expectedUninstallExitCodes,
+            verifyDetection: args.verifyDetection,
+            testUninstall: args.testUninstall,
+            collectEventLogs: args.collectEventLogs,
+            includeSnapshots: args.includeSnapshots,
+            includeFiles: args.includeFiles,
+          },
+          (args.installTimeoutMs ?? 1800000) + (args.uninstallTimeoutMs ?? 900000) + 420000,
+        )
+      ).data,
+    );
+
+    let footprint: any = null;
+    let residue: any = null;
+    const beforeId = deployment?.snapshots?.beforeInstall?.snapshotId;
+    const afterInstallId = deployment?.snapshots?.afterInstall?.snapshotId;
+    const afterUninstallId = deployment?.snapshots?.afterUninstall?.snapshotId;
+    if (beforeId && afterInstallId) {
+      footprint = await diffSnapshots({ bridgeRoot }, beforeId, afterInstallId, new Date().toISOString());
+    }
+    if (beforeId && afterUninstallId) {
+      residue = await diffSnapshots({ bridgeRoot }, beforeId, afterUninstallId, new Date().toISOString());
+    }
+
+    const dossier = args.buildDossier
+      ? await buildPackagingDossier({
+          bridgeRoot,
+          appName: args.appName ?? args.setupFile ?? path.basename(args.sourceHostFolder ?? sourceFolder ?? "Intune package"),
+          sourceHostFolder: args.sourceHostFolder ?? staged?.hostPath,
+          setupFile: args.setupFile,
+          installCommand: args.installCommand,
+          uninstallCommand: args.uninstallCommand,
+          detectionRule: args.detectionRule,
+          deployment,
+          footprint,
+          residue,
+          notes: ["IME simulation runs inside Windows Sandbox; use a real Intune pilot for final tenant validation."],
+        })
+      : null;
+
+    return text({ stagedSource: staged, deployment, footprint, residue, dossier });
+  },
+);
+
+server.registerTool(
+  "sandbox_build_packaging_dossier",
+  {
+    title: "Build an Intune packaging dossier",
+    description:
+      "Create a Markdown and JSON handoff dossier from packaging evidence: install/uninstall commands, " +
+      "detection rule, IME simulation result, package result, footprint and residue diffs, source hashes, " +
+      "warnings, and artifact paths. Use after sandbox_test_intune_deployment or sandbox_intune_package_win32.",
+    inputSchema: {
+      appName: z.string().optional(),
+      sourceHostFolder: z.string().optional().describe("Optional host source folder to hash into a source manifest."),
+      setupFile: z.string().optional(),
+      installCommand: z.string().optional(),
+      uninstallCommand: z.string().optional(),
+      detectionRule: z.any().optional(),
+      deploymentResult: z.any().optional().describe("Result object returned as deployment by sandbox_test_intune_deployment."),
+      packagingResult: z.any().optional().describe("Packaging result from sandbox_intune_package_win32 or sandbox_intune_package_from_host.packaging."),
+      footprint: z.any().optional().describe("Snapshot diff result for install footprint."),
+      residue: z.any().optional().describe("Snapshot diff result for uninstall residue."),
+      notes: z.array(z.string()).optional(),
+    },
+  },
+  async (args) =>
+    text(
+      await buildPackagingDossier({
+        bridgeRoot,
+        appName: args.appName,
+        sourceHostFolder: args.sourceHostFolder,
+        setupFile: args.setupFile,
+        installCommand: args.installCommand,
+        uninstallCommand: args.uninstallCommand,
+        detectionRule: args.detectionRule,
+        deployment: args.deploymentResult,
+        packaging: args.packagingResult,
+        footprint: args.footprint,
+        residue: args.residue,
+        notes: args.notes,
+      }),
+    ),
 );
 
 server.registerTool(

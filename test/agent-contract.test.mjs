@@ -108,6 +108,22 @@ test("0.6.0-D: deeper watcher (real-time files + services/tasks/autoruns)", () =
   assert.match(serverSrc, /watchRunKeys/);
 });
 
+test("0.6.0-E: Intune IME simulation, dossier, and workflow prompts are registered", () => {
+  assert.ok(advertisedCommands().includes("intune_ime_simulate"));
+  assert.match(guestSrc, /function Invoke-IntuneImeSimulation/);
+  assert.match(guestSrc, /Invoke-ScheduledSystemCommandTest/);
+  assert.match(guestSrc, /Resolve-PowerShellExecutable/);
+  assert.match(serverSrc, /"sandbox_test_intune_deployment"/);
+  assert.match(serverSrc, /"sandbox_build_packaging_dossier"/);
+  assert.match(serverSrc, /buildPackagingDossier/);
+  for (const prompt of ["intune_package_app_from_folder", "silent_install_test_workflow", "user_guide_creation_workflow"]) {
+    assert.match(serverSrc, new RegExp(`"${prompt}"`));
+  }
+  for (const resource of ["sandbox-pilot://workflows/intune-packaging", "sandbox-pilot://schemas/detection-rule"]) {
+    assert.match(serverSrc, new RegExp(resource.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+});
+
 test("0.5.0-C: numeric progress + generic job streaming", () => {
   // Guest parses winget's byte fraction into a numeric percent.
   assert.match(guestSrc, /function Get-WinGetProgress/);

@@ -52,12 +52,29 @@ Or use the repo-root helper, which also prints your MCP client config: `..\setup
 | `sandbox_snapshot` | Capture a baseline of files (common install roots), registry values (Uninstall/Run keys), installed programs, and services into `artifacts/snapshots/<id>`; roots overridable, with caps and truncated flags. |
 | `sandbox_diff_snapshots` | Diff two snapshots and report added/removed/changed per section; writes `diff.json` + `diff.md` under `artifacts/snapshots/diffs/<diffId>`. Powers footprint docs and uninstall-residue checks. |
 | `sandbox_start_job` / `sandbox_job_status` / `sandbox_job_cancel` | Run long PowerShell operations asynchronously, poll status/log tails, and cancel the process tree if needed. |
+| `sandbox_test_intune_deployment` | Simulate an Intune Management Extension run: copy source into an isolated IME-like cache, run install from that working directory as SYSTEM or user context with x64/x86 PowerShell, collect event logs/blocking UI evidence, verify detection after install, run uninstall, verify detection is absent, attach footprint/residue diffs, and optionally build a dossier. |
+| `sandbox_build_packaging_dossier` | Build Markdown/JSON handoff docs from deployment/package evidence, including commands, detection rule, verdict, warnings, source/package hashes, footprint, residue, and artifact paths. |
 | `sandbox_intune_prereqs` | Find or download Microsoft's IntuneWinAppUtil.exe into the shared `tools` folder and report version/source information. |
 | `sandbox_intune_package_win32` | Test install, verify detection, test uninstall, verify detection absence, then run IntuneWinAppUtil.exe to create a `.intunewin` package under shared `artifacts/intune`, with host paths and deployment metadata suggestions. |
 | `sandbox_center_window` | Center the foreground window for clean screenshots. |
 | `sandbox_annotate` | Draw boxes/arrows/labels/spotlight/redact on a screenshot (screen or image coords; screen mode is capture-offset aware, so window/region shots annotate correctly). `redact` solid-fills or pixelates a region for masking sensitive data. |
 | `sandbox_record_start` / `sandbox_record_stop` | Auto-record a guide: while active, each action (open/click/double_click/invoke/type/key) appends a captioned, target-annotated screenshot step to the named guide. |
 | `sandbox_guide_step` / `sandbox_guide_build` / `sandbox_guide_reset` | Record captioned (optionally annotated) screenshot steps into a named guide, then assemble them into Markdown, self-contained HTML, and/or PDF documents with embedded images. |
+
+## Prompts and resources
+
+Sandbox Pilot registers workflow prompts so agents can start from a proven sequence instead of
+rediscovering the tool order:
+
+- `intune_package_app_from_folder`
+- `silent_install_test_workflow`
+- `user_guide_creation_workflow`
+
+It also exposes static resources with compact instructions and schemas:
+
+- `sandbox-pilot://workflows/intune-packaging`
+- `sandbox-pilot://workflows/user-guide`
+- `sandbox-pilot://schemas/detection-rule`
 
 Sensing guidance baked into the tool descriptions: prefer `sandbox_ui_tree` for "what's on
 screen / where to click" (cheap, exact coordinates); use `sandbox_screenshot` for visual
