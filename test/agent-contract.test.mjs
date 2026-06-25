@@ -91,9 +91,26 @@ test("the event bus auto-starts and emits program/file events with a generalized
   assert.match(serverSrc, /"sandbox_wait_for_event"/);
 });
 
-test("server and guest version are bumped to 0.6.0 so a stale agent is visible", () => {
-  assert.match(serverSrc, /SERVER_VERSION\s*=\s*"0\.6\.0"/);
-  assert.match(guestSrc, /\$AgentVersion\s*=\s*"0\.6\.0"/);
+test("server and guest version are bumped to 0.7.0 so a stale agent is visible", () => {
+  assert.match(serverSrc, /SERVER_VERSION\s*=\s*"0\.7\.0"/);
+  assert.match(guestSrc, /\$AgentVersion\s*=\s*"0\.7\.0"/);
+});
+
+test("0.7.0: PSADT packaging tools are registered and wired end to end", () => {
+  // Guest advertises the two PSADT commands and has dispatcher cases + implementations.
+  const cmds = advertisedCommands();
+  assert.ok(cmds.includes("psadt_prereqs"), "psadt_prereqs advertised");
+  assert.ok(cmds.includes("psadt_build"), "psadt_build advertised");
+  assert.match(guestSrc, /function Resolve-PsadtToolkit/);
+  assert.match(guestSrc, /function Invoke-PsadtBuild/);
+  // Download is pinned to the official PSADT GitHub releases (mirror of the IntuneWinAppUtil guard).
+  assert.match(guestSrc, /Refusing to auto-download PSAppDeployToolkit from a non-PSADT GitHub release URL/);
+  assert.match(guestSrc, /github\.com\/PSAppDeployToolkit\/PSAppDeployToolkit\/releases\/download/);
+  // Server registers both tools, plus the workflow prompt and resource.
+  assert.match(serverSrc, /"sandbox_psadt_prereqs"/);
+  assert.match(serverSrc, /"sandbox_psadt_build"/);
+  assert.match(serverSrc, /"psadt_package_app"/);
+  assert.match(serverSrc, /sandbox-pilot:\/\/workflows\/psadt-packaging/);
 });
 
 test("0.6.0-D: deeper watcher (real-time files + services/tasks/autoruns)", () => {

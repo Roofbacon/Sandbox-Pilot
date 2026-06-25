@@ -35,13 +35,15 @@ Sandbox Pilot exposes [Windows Sandbox](https://learn.microsoft.com/en-us/window
 | **Snapshot / diff** | `sandbox_snapshot`, `sandbox_diff_snapshots` - baseline files/registry/programs/services, then diff before vs after to see exactly what an installer changed (footprint docs + uninstall-residue checks) |
 | **Diagnostics** | `sandbox_event_logs` - collect Application/System event-log entries (Critical/Error/Warning + MsiInstaller) for a time window; `sandbox_test_install_command` also captures them around the install window |
 | **Intune packaging** | `sandbox_test_intune_deployment`, `sandbox_build_packaging_dossier`, `sandbox_intune_prereqs`, `sandbox_intune_package_win32`, `sandbox_intune_package_from_host` - run an IME-style install/uninstall simulation, verify detection, build a packaging dossier, auto-install Microsoft's Win32 Content Prep Tool if needed, and save `.intunewin` packages to shared artifacts |
+| **PSADT packaging** | `sandbox_psadt_prereqs`, `sandbox_psadt_build` - fetch the [PowerShell App Deployment Toolkit](https://github.com/psappdeploytoolkit/psappdeploytoolkit) template from its official GitHub release, scaffold a deployment package, copy the installer into `Files\`, set app metadata + install/uninstall commands, optionally overlay a **company branding template** (logos/banners/config), test-install the package in the Sandbox, and wrap it into a `.intunewin` |
 | **Long jobs** | `sandbox_start_job`, `sandbox_job_status`, `sandbox_job_cancel` - run long PowerShell operations without blocking the MCP call, with persisted stdout/stderr artifacts |
 | **Document** | `sandbox_annotate` (boxes/arrows/labels/spotlight/**redact**), `sandbox_record_start` + `sandbox_record_stop` (auto-capture a step per action), `sandbox_guide_step` + `sandbox_guide_build` (Markdown/HTML/PDF) + `sandbox_guide_reset` |
 | **Lifecycle** | `sandbox_prepare` (one call to a control-ready Sandbox; `fresh=true` to force a clean boot), `sandbox_stop` (reset — destroy the VM), `sandbox_status`, `sandbox_cleanup` (prune old run artifacts) |
 
 Sandbox Pilot also exposes MCP prompts/resources for common workflows:
 `intune_package_app_from_folder`, `silent_install_test_workflow`, `user_guide_creation_workflow`,
-`sandbox-pilot://workflows/intune-packaging`, `sandbox-pilot://workflows/user-guide`, and
+`psadt_package_app`, `sandbox-pilot://workflows/intune-packaging`,
+`sandbox-pilot://workflows/psadt-packaging`, `sandbox-pilot://workflows/user-guide`, and
 `sandbox-pilot://schemas/detection-rule`.
 
 > **Agent compatibility.** The guest agent reports a version and wire-protocol number; `sandbox_health` compares them against the server's and returns a `compatibility` block. If it carries a `warning`, the agent in the Sandbox is stale — redeploy it with `host\SandboxBridge.ps1 reload-agent`. Run artifacts (job logs, test-plan runs, snapshots, screenshots) accumulate in the shared bridge; `sandbox_cleanup` prunes them by age/count (recorded guides are left alone unless you opt in).
@@ -242,6 +244,18 @@ For a normal host folder, prefer `sandbox_intune_package_from_host`. It stages t
 Use `sandbox_intune_package_win32` after you have a source folder, setup file, and install/uninstall commands. By default it runs install, detection, uninstall, and detection-absent checks first, and skips package creation if any concrete check fails. Pass `testInstall: false`, `verifyDetection: false`, or `testUninstall: false` only when intentionally bypassing that validation. If `IntuneWinAppUtil.exe` is missing, the tool can download the official Microsoft Win32 Content Prep Tool into `C:\SandboxBridge\tools`, keeping it outside the package source folder.
 
 Generated `.intunewin` files are written to `C:\SandboxBridge\artifacts\intune` by default and returned with host paths under `bridge\artifacts\intune`, so the user can pick them up directly. The result also includes install-test, detection, uninstall-test, and detection-absent results, packaging stdout/stderr, the Intune install/uninstall command summary, an MSI product-code detection suggestion when applicable, and standard return-code recommendations.
+
+## Building PSADT packages
+
+`sandbox_psadt_build` wraps an installer in a [PowerShell App Deployment Toolkit](https://github.com/psappdeploytoolkit/psappdeploytoolkit) (PSADT) package. Give it an `appName`, a `sourceHostFolder` containing the installer payload, and (ideally) the `setupFile` inside it. The tool:
+
+1. Fetches the PSADT template from the official GitHub release (default **v4**, version **4.1.8**; `frontend: "v3"` for the legacy `Deploy-Application.ps1` layout) and caches it under `C:\SandboxBridge\tools\psadt`. `sandbox_psadt_prereqs` does just this step, and downloads are pinned to the `PSAppDeployToolkit/PSAppDeployToolkit` release assets.
+2. Scaffolds a fresh package, copies the host installer folder into `Files\`, sets the app metadata (`AppVendor`/`AppName`/`AppVersion`/`AppArch`/`AppLang`) in `Invoke-AppDeployToolkit.ps1`, and injects an install/uninstall task line — inferred from `setupFile` (MSI → `Start-ADTMsiProcess`, EXE → `Start-ADTProcess`) unless you pass an explicit `installCommand`/`uninstallCommand`.
+3. **Overlays a company branding template** when `useCompanyTemplate` is true (the default): logos, banners, `config.psd1`, and `strings.psd1` are copied over the scaffolded package. The template folder is resolved from `templateHostFolder` (explicit), else the `SANDBOX_PSADT_TEMPLATE` environment variable, else the bundled skeleton at [`assets/psadt-template`](assets/psadt-template) — drop your brand assets there or point the env var at your own folder. See that folder's `README.md` for the expected layout.
+4. With `testInstall` (default), runs the built package's `Invoke-AppDeployToolkit.exe -DeploymentType Install -DeployMode Silent` (and the uninstall) inside the disposable Sandbox to prove it works.
+5. With `packageIntunewin: true`, wraps the package into a `.intunewin` via the same IntuneWinAppUtil path used by the Intune tools (`setupFile = Invoke-AppDeployToolkit.exe`), and copies it to `outputHostFolder` when given.
+
+The result returns the built package folder (with a host path), the applied branding files, the PSADT and Intune-facing install/uninstall commands, any test-install result, and the `.intunewin` packaging result. Anything the tool could not patch automatically (e.g. a missing section marker) is reported in `warnings`, with a `# PSADT-PILOT` marker left in the script for manual follow-up.
 
 ## Noticing things in real time
 

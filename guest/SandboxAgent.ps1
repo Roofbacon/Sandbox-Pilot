@@ -14,7 +14,7 @@ $ErrorActionPreference = "Stop"
 # Agent version + wire protocol. The protocol is bumped only on a breaking change to the
 # command/result contract; the MCP server compares it during sandbox_health to catch a stale
 # agent (guest/server drift) loudly instead of failing on an unknown command later.
-$AgentVersion = "0.6.0"
+$AgentVersion = "0.7.0"
 $AgentProtocol = 1
 
 # Command types this agent advertises (see Invoke-AgentCommand). Get-AgentCapabilities returns
@@ -29,6 +29,7 @@ $AgentCommands = @(
     "job_start_ps", "job_status", "job_cancel",
     "winget_bootstrap", "winget", "winget_start", "winget_status",
     "intune_prereqs", "intune_package", "intune_ime_simulate",
+    "psadt_prereqs", "psadt_build",
     "processes", "screen_info", "stop_agent"
 )
 
@@ -3076,6 +3077,283 @@ function Invoke-IntuneWin32Package {
     }
 }
 
+# ---- PSAppDeployToolkit (PSADT) packaging --------------------------------
+# Fetch a PSADT template from the official GitHub release, scaffold a deployment package, copy the
+# installer payload into Files\, patch the entry script's app metadata + install/uninstall lines,
+# and optionally overlay a company branding template (logos/banners/config). Mirrors the Intune
+# packaging path so the result can be test-installed and wrapped into a .intunewin downstream.
+
+function Resolve-PsadtToolkit {
+    param(
+        [string]$Version = "4.1.8",
+        [string]$Frontend = "v4",
+        [bool]$EnsureTool = $true,
+        [string]$DownloadUrl = ""
+    )
+
+    if (-not $Version) { $Version = "4.1.8" }
+    $Frontend = $Frontend.ToLowerInvariant()
+    if (@("v4", "v3") -notcontains $Frontend) { throw "frontend must be 'v4' or 'v3', got '$Frontend'." }
+
+    $entryName = $(if ($Frontend -eq "v4") { "Invoke-AppDeployToolkit.ps1" } else { "Deploy-Application.ps1" })
+    $defaultUrl = "https://github.com/PSAppDeployToolkit/PSAppDeployToolkit/releases/download/$Version/PSAppDeployToolkit_Template_$Frontend.zip"
+    if (-not $DownloadUrl) { $DownloadUrl = $defaultUrl }
+
+    $cacheRoot = Join-Path (Join-Path (Join-Path $ToolsDir "psadt") $Version) $Frontend
+    $searched = New-Object System.Collections.ArrayList
+    [void]$searched.Add($cacheRoot)
+    $downloaded = $false
+    $templateRoot = $null
+
+    if (Test-Path -LiteralPath $cacheRoot) {
+        $entry = Get-ChildItem -LiteralPath $cacheRoot -Filter $entryName -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($entry) { $templateRoot = $entry.Directory.FullName }
+    }
+
+    if (-not $templateRoot -and $EnsureTool) {
+        # Pin to the official PSADT GitHub releases (mirror of the IntuneWinAppUtil download guard).
+        if ($DownloadUrl -notmatch '^https://github\.com/PSAppDeployToolkit/PSAppDeployToolkit/releases/download/') {
+            throw "Refusing to auto-download PSAppDeployToolkit from a non-PSADT GitHub release URL: $DownloadUrl"
+        }
+        New-Item -ItemType Directory -Force -Path $cacheRoot | Out-Null
+        $tmpZip = Join-Path $env:TEMP ("psadt-{0}-{1}.zip" -f $Version, $Frontend)
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
+        Invoke-WebRequest -Uri $DownloadUrl -OutFile $tmpZip -UseBasicParsing
+        Expand-Archive -LiteralPath $tmpZip -DestinationPath $cacheRoot -Force
+        Remove-Item -LiteralPath $tmpZip -Force -ErrorAction SilentlyContinue
+        $downloaded = $true
+        $entry = Get-ChildItem -LiteralPath $cacheRoot -Filter $entryName -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($entry) { $templateRoot = $entry.Directory.FullName }
+    }
+
+    if (-not $templateRoot) {
+        return [ordered]@{
+            available = $false
+            templateRoot = $null
+            assetsDir = $null
+            entryScript = $entryName
+            frontend = $Frontend
+            version = $Version
+            downloaded = $downloaded
+            downloadUrl = $DownloadUrl
+            searched = @($searched)
+        }
+    }
+
+    $assetsDir = $null
+    $assetsCandidate = Join-Path $templateRoot "Assets"
+    if (Test-Path -LiteralPath $assetsCandidate) { $assetsDir = $assetsCandidate }
+
+    return [ordered]@{
+        available = $true
+        templateRoot = $templateRoot
+        assetsDir = $assetsDir
+        entryScript = $entryName
+        frontend = $Frontend
+        version = $Version
+        downloaded = $downloaded
+        downloadUrl = $(if ($downloaded) { $DownloadUrl } else { $null })
+        bridgeRelativePath = ConvertTo-BridgeRelativePath -Path $templateRoot
+        searched = @($searched)
+    }
+}
+
+function Set-PsadtSessionValue {
+    # Replace a single-quoted value of a key inside the v4 $adtSession = @{ ... } hashtable.
+    param([string]$Text, [string]$Key, [string]$Value)
+    $escaped = $Value -replace "'", "''"
+    $pattern = "(?m)^(\s*$Key\s*=\s*)'[^']*'"
+    if ($Text -match $pattern) {
+        return [regex]::Replace($Text, $pattern, "`${1}'$escaped'", 1)
+    }
+    return $Text
+}
+
+function Set-PsadtV3Variable {
+    # Replace a single-quoted value of a v3 Deploy-Application.ps1 variable ([String]$appName = '...').
+    param([string]$Text, [string]$Name, [string]$Value)
+    $escaped = $Value -replace "'", "''"
+    $pattern = "(?m)^(\s*(?:\[[Ss]tring\]\s*)?\`$$Name\s*=\s*)'[^']*'"
+    if ($Text -match $pattern) {
+        return [regex]::Replace($Text, $pattern, "`${1}'$escaped'", 1)
+    }
+    return $Text
+}
+
+function Add-PsadtTaskLine {
+    # Inject a command line immediately after a PSADT section marker comment (v3 and v4 share these).
+    param([string]$Text, [string]$Marker, [string]$Line, $Warnings, [string]$Section)
+    $idx = $Text.IndexOf($Marker)
+    if ($idx -lt 0) {
+        if ($Warnings) { [void]$Warnings.Add("Could not locate the $Section marker '$Marker'; the command was not injected. Edit the entry script manually.") }
+        return $Text
+    }
+    $insertAt = $idx + $Marker.Length
+    $injection = "`r`n    # Injected by Sandbox Pilot (PSADT-PILOT)`r`n    $Line"
+    return $Text.Substring(0, $insertAt) + $injection + $Text.Substring($insertAt)
+}
+
+function ConvertTo-PsadtCommandLine {
+    # Translate an installer setup file into a PSADT install/uninstall call for the entry script body.
+    param([string]$SetupFileName, [string]$Extension, [string]$Frontend, [bool]$IsUninstall = $false)
+    $ext = $Extension.ToLowerInvariant()
+    $literal = $SetupFileName -replace "'", "''"
+    if ($Frontend -eq "v4") {
+        if ($ext -eq ".msi") {
+            $action = $(if ($IsUninstall) { "Uninstall" } else { "Install" })
+            return "Start-ADTMsiProcess -Action $action -FilePath '$literal'"
+        }
+        if ($IsUninstall) { return $null }
+        return "Start-ADTProcess -FilePath '$literal' -ArgumentList '/S'"
+    }
+    if ($ext -eq ".msi") {
+        $action = $(if ($IsUninstall) { "Uninstall" } else { "Install" })
+        return "Execute-MSI -Action $action -Path '$literal'"
+    }
+    if ($IsUninstall) { return $null }
+    return "Execute-Process -Path '$literal' -Parameters '/S'"
+}
+
+function Invoke-PsadtBuild {
+    param(
+        [string]$AppName,
+        [string]$AppVersion = "1.0.0",
+        [string]$AppVendor = "",
+        [string]$AppArch = "x64",
+        [string]$AppLang = "EN",
+        [string]$SourceFolder = "",
+        [string]$SetupFile = "",
+        [string]$InstallCommand = "",
+        [string]$UninstallCommand = "",
+        [string]$Frontend = "v4",
+        [string]$Version = "4.1.8",
+        [string]$OutputFolder = "",
+        [string]$TemplateFolder = "",
+        [string]$DownloadUrl = "",
+        [bool]$EnsureTool = $true
+    )
+
+    if (-not $AppName) { throw "appName is required." }
+    $Frontend = $Frontend.ToLowerInvariant()
+    $warnings = New-Object System.Collections.ArrayList
+
+    $toolkit = Resolve-PsadtToolkit -Version $Version -Frontend $Frontend -EnsureTool $EnsureTool -DownloadUrl $DownloadUrl
+    if (-not $toolkit.available) { throw "PSAppDeployToolkit template ($Frontend $Version) was not found. Pass ensureTool=true to download it." }
+
+    # Resolve the output package folder under processed\.
+    $safeName = ($AppName -replace '[^A-Za-z0-9_.-]+', '_').Trim('_')
+    if (-not $safeName) { $safeName = "PsadtPackage" }
+    if (-not $OutputFolder) { $OutputFolder = Join-Path $ProcessedDir $safeName }
+    if (Test-Path -LiteralPath $OutputFolder) { Remove-Item -LiteralPath $OutputFolder -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $OutputFolder | Out-Null
+
+    # 1. Copy the PSADT template into the package folder (wildcard needs -Path, not -LiteralPath).
+    Copy-Item -Path (Join-Path $toolkit.templateRoot '*') -Destination $OutputFolder -Recurse -Force
+
+    # 2. Copy the installer payload into Files\.
+    $filesDir = Join-Path $OutputFolder "Files"
+    New-Item -ItemType Directory -Force -Path $filesDir | Out-Null
+    $filesCopied = 0
+    if ($SourceFolder) {
+        if (-not (Test-Path -LiteralPath $SourceFolder)) { throw "sourceFolder does not exist: $SourceFolder" }
+        $resolvedSource = (Resolve-Path -LiteralPath $SourceFolder).Path
+        Copy-Item -Path (Join-Path $resolvedSource '*') -Destination $filesDir -Recurse -Force -ErrorAction SilentlyContinue
+        $filesCopied = @(Get-ChildItem -LiteralPath $filesDir -Recurse -File -ErrorAction SilentlyContinue).Count
+    }
+
+    # 3. Infer install/uninstall commands from the setup file when not supplied.
+    $setupFileName = ""
+    $setupExt = ""
+    if ($SetupFile) {
+        $setupFileName = [System.IO.Path]::GetFileName($SetupFile)
+        $setupExt = [System.IO.Path]::GetExtension($SetupFile)
+    }
+    $installLine = $InstallCommand
+    $uninstallLine = $UninstallCommand
+    if (-not $installLine -and $setupFileName) {
+        $installLine = ConvertTo-PsadtCommandLine -SetupFileName $setupFileName -Extension $setupExt -Frontend $Frontend -IsUninstall $false
+    }
+    if (-not $uninstallLine -and $setupFileName) {
+        $uninstallLine = ConvertTo-PsadtCommandLine -SetupFileName $setupFileName -Extension $setupExt -Frontend $Frontend -IsUninstall $true
+    }
+    if (-not $installLine) {
+        [void]$warnings.Add("No install command was supplied or inferable (provide setupFile or installCommand); the install section was left as the template default.")
+    }
+
+    # 4. Patch the entry script: app metadata + install/uninstall task lines.
+    $entryPath = Join-Path $OutputFolder $toolkit.entryScript
+    if (Test-Path -LiteralPath $entryPath) {
+        $entryText = Get-Content -LiteralPath $entryPath -Raw
+        if ($Frontend -eq "v4") {
+            $entryText = Set-PsadtSessionValue -Text $entryText -Key "AppVendor" -Value $AppVendor
+            $entryText = Set-PsadtSessionValue -Text $entryText -Key "AppName" -Value $AppName
+            $entryText = Set-PsadtSessionValue -Text $entryText -Key "AppVersion" -Value $AppVersion
+            $entryText = Set-PsadtSessionValue -Text $entryText -Key "AppArch" -Value $AppArch
+            $entryText = Set-PsadtSessionValue -Text $entryText -Key "AppLang" -Value $AppLang
+        }
+        else {
+            $entryText = Set-PsadtV3Variable -Text $entryText -Name "appVendor" -Value $AppVendor
+            $entryText = Set-PsadtV3Variable -Text $entryText -Name "appName" -Value $AppName
+            $entryText = Set-PsadtV3Variable -Text $entryText -Name "appVersion" -Value $AppVersion
+            $entryText = Set-PsadtV3Variable -Text $entryText -Name "appArch" -Value $AppArch
+            $entryText = Set-PsadtV3Variable -Text $entryText -Name "appLang" -Value $AppLang
+        }
+        if ($installLine) {
+            $entryText = Add-PsadtTaskLine -Text $entryText -Marker '## <Perform Installation tasks here>' -Line $installLine -Warnings $warnings -Section "install"
+        }
+        if ($uninstallLine) {
+            $entryText = Add-PsadtTaskLine -Text $entryText -Marker '## <Perform Uninstallation tasks here>' -Line $uninstallLine -Warnings $warnings -Section "uninstall"
+        }
+        [System.IO.File]::WriteAllText($entryPath, $entryText, (New-Object System.Text.UTF8Encoding($true)))
+    }
+    else {
+        [void]$warnings.Add("Entry script $($toolkit.entryScript) was not found in the template; metadata and commands were not patched.")
+    }
+
+    # 5. Branding overlay: copy a company template folder over the scaffolded package.
+    $brandingApplied = New-Object System.Collections.ArrayList
+    if ($TemplateFolder) {
+        if (Test-Path -LiteralPath $TemplateFolder) {
+            $resolvedTemplate = (Resolve-Path -LiteralPath $TemplateFolder).Path
+            $templateBase = $resolvedTemplate.TrimEnd('\')
+            foreach ($item in @(Get-ChildItem -LiteralPath $resolvedTemplate -Recurse -File -ErrorAction SilentlyContinue)) {
+                $rel = $item.FullName.Substring($templateBase.Length + 1)
+                if (($rel -ieq "README.md") -or ([System.IO.Path]::GetFileName($rel) -ieq ".gitkeep")) { continue }
+                $dest = Join-Path $OutputFolder $rel
+                $destDir = [System.IO.Path]::GetDirectoryName($dest)
+                if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Force -Path $destDir | Out-Null }
+                Copy-Item -LiteralPath $item.FullName -Destination $dest -Force
+                [void]$brandingApplied.Add($rel)
+            }
+        }
+        else {
+            [void]$warnings.Add("templateFolder does not exist: $TemplateFolder")
+        }
+    }
+
+    # 6. Intune-facing commands for the wrapped package.
+    $exeName = $(if ($Frontend -eq "v4") { "Invoke-AppDeployToolkit.exe" } else { "Deploy-Application.exe" })
+    return [ordered]@{
+        appName = $AppName
+        appVersion = $AppVersion
+        appVendor = $AppVendor
+        frontend = $Frontend
+        version = $toolkit.version
+        packageFolder = (Resolve-Path -LiteralPath $OutputFolder).Path
+        bridgeRelativePath = ConvertTo-BridgeRelativePath -Path $OutputFolder
+        entryScript = $toolkit.entryScript
+        setupFile = $exeName
+        intuneInstallCommand = "$exeName -DeploymentType Install -DeployMode Silent"
+        intuneUninstallCommand = "$exeName -DeploymentType Uninstall -DeployMode Silent"
+        psadtInstallLine = $installLine
+        psadtUninstallLine = $uninstallLine
+        filesCopied = $filesCopied
+        brandingApplied = @($brandingApplied)
+        toolkit = $toolkit
+        warnings = @($warnings)
+    }
+}
+
 function Invoke-MouseClick {
     param(
         [int]$X,
@@ -3744,6 +4022,31 @@ function Invoke-AgentCommand {
             $includeSnapshots = [bool](Get-ArgValue $args "includeSnapshots" $true)
             $includeFiles = [bool](Get-ArgValue $args "includeFiles" $false)
             return @{ data = (Invoke-IntuneImeSimulation -SourceFolder $sourceFolder -InstallCommand $installCommand -UninstallCommand $uninstallCommand -DetectionRule $detectionRule -InstallContext $installContext -Architecture $architecture -InstallTimeoutMs $installTimeoutMs -UninstallTimeoutMs $uninstallTimeoutMs -ExpectedInstallExitCodes $expectedInstallExitCodes -ExpectedUninstallExitCodes $expectedUninstallExitCodes -VerifyDetection $verifyDetection -TestUninstall $testUninstall -CollectEventLogs $collectEventLogs -IncludeSnapshots $includeSnapshots -IncludeFiles $includeFiles) }
+        }
+        "psadt_prereqs" {
+            $version = [string](Get-ArgValue $args "version" "4.1.8")
+            $frontend = [string](Get-ArgValue $args "frontend" "v4")
+            $ensureTool = [bool](Get-ArgValue $args "ensureTool" $true)
+            $downloadUrl = [string](Get-ArgValue $args "downloadUrl" "")
+            return @{ data = (Resolve-PsadtToolkit -Version $version -Frontend $frontend -EnsureTool $ensureTool -DownloadUrl $downloadUrl) }
+        }
+        "psadt_build" {
+            $appName = [string](Get-ArgValue $args "appName" "")
+            $appVersion = [string](Get-ArgValue $args "appVersion" "1.0.0")
+            $appVendor = [string](Get-ArgValue $args "appVendor" "")
+            $appArch = [string](Get-ArgValue $args "appArch" "x64")
+            $appLang = [string](Get-ArgValue $args "appLang" "EN")
+            $sourceFolder = [string](Get-ArgValue $args "sourceFolder" "")
+            $setupFile = [string](Get-ArgValue $args "setupFile" "")
+            $installCommand = [string](Get-ArgValue $args "installCommand" "")
+            $uninstallCommand = [string](Get-ArgValue $args "uninstallCommand" "")
+            $frontend = [string](Get-ArgValue $args "frontend" "v4")
+            $version = [string](Get-ArgValue $args "version" "4.1.8")
+            $outputFolder = [string](Get-ArgValue $args "outputFolder" "")
+            $templateFolder = [string](Get-ArgValue $args "templateFolder" "")
+            $downloadUrl = [string](Get-ArgValue $args "downloadUrl" "")
+            $ensureTool = [bool](Get-ArgValue $args "ensureTool" $true)
+            return @{ data = (Invoke-PsadtBuild -AppName $appName -AppVersion $appVersion -AppVendor $appVendor -AppArch $appArch -AppLang $appLang -SourceFolder $sourceFolder -SetupFile $setupFile -InstallCommand $installCommand -UninstallCommand $uninstallCommand -Frontend $frontend -Version $version -OutputFolder $outputFolder -TemplateFolder $templateFolder -DownloadUrl $downloadUrl -EnsureTool $ensureTool) }
         }
         "processes" {
             $processes = Get-Process |

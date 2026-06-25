@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-import { annotate, bridgeInfo, runBridgeAction, stageHostPath, toBridgeHostPath, bridgeRoot } from "./bridge.js";
+import { annotate, bridgeInfo, runBridgeAction, stageHostPath, toBridgeHostPath, bridgeRoot, projectRoot } from "./bridge.js";
 import * as fileBridge from "./bridge.js";
 import * as socketBridge from "./socket-bridge.js";
 import { runTestPlan } from "./testplan.js";
@@ -20,7 +20,7 @@ const TRANSPORT = process.env.SANDBOX_TRANSPORT === "socket" ? socketBridge : fi
 const sendCommand = TRANSPORT.sendCommand;
 const screenshot = TRANSPORT.screenshot;
 
-const SERVER_VERSION = "0.6.0";
+const SERVER_VERSION = "0.7.0";
 // Bump only on a breaking change to the guest command/result contract. sandbox_health compares
 // this with the value the guest agent reports, so a stale agent surfaces as a clear warning.
 const EXPECTED_GUEST_PROTOCOL = 1;
@@ -46,6 +46,20 @@ const workflowResources: Record<string, { title: string; description: string; te
       "4. Review deployment.verdict, failures, blockingWindows, footprint, and residue before packaging.\n" +
       "5. Call sandbox_intune_package_from_host only after the IME simulation passes.\n" +
       "6. Call sandbox_build_packaging_dossier with the deployment and packaging results for the handoff artifact.\n",
+  },
+  "sandbox-pilot://workflows/psadt-packaging": {
+    title: "PSADT Packaging Workflow",
+    description: "Recommended workflow for scaffolding a PowerShell App Deployment Toolkit (PSADT) package.",
+    text:
+      "# PSADT Packaging Workflow\n\n" +
+      "1. Call sandbox_prepare (fresh=true for clean state).\n" +
+      "2. Call sandbox_psadt_prereqs to download/cache the PSADT template (default v4 4.1.8).\n" +
+      "3. Call sandbox_psadt_build with appName, appVersion, appVendor, sourceHostFolder (the installer payload), " +
+      "and setupFile (so the install/uninstall command can be inferred). Set useCompanyTemplate=true to overlay " +
+      "the company branding template (logos/banners/config), or pass templateHostFolder to point at a specific one.\n" +
+      "4. Leave testInstall=true to prove the PSADT package installs (and uninstalls) inside the Sandbox.\n" +
+      "5. Set packageIntunewin=true to also wrap the package into a .intunewin (setupFile=Invoke-AppDeployToolkit.exe).\n" +
+      "6. Optionally call sandbox_build_packaging_dossier over the result for the handoff artifact.\n",
   },
   "sandbox-pilot://workflows/user-guide": {
     title: "User Guide Workflow",
@@ -161,6 +175,40 @@ server.registerPrompt(
   }),
 );
 
+server.registerPrompt(
+  "psadt_package_app",
+  {
+    title: "Package App with PSADT",
+    description: "Guide an agent through fetching PSADT, scaffolding a deployment package, applying company branding, and proving it.",
+    argsSchema: {
+      appName: z.string().describe("Application name."),
+      sourceHostFolder: z.string().describe("Host folder containing the installer payload."),
+      setupFile: z.string().optional().describe("Setup file inside sourceHostFolder (drives install-command inference)."),
+      appVersion: z.string().optional().describe("Application version."),
+      appVendor: z.string().optional().describe("Application vendor."),
+    },
+  },
+  async ({ appName, sourceHostFolder, setupFile, appVersion, appVendor }) => ({
+    messages: [
+      {
+        role: "user",
+        content: {
+          type: "text",
+          text:
+            `Package ${appName} as a PSADT (PowerShell App Deployment Toolkit) deployment from ${sourceHostFolder}.\n\n` +
+            `${setupFile ? `Setup file: ${setupFile}\n` : ""}` +
+            `${appVersion ? `Version: ${appVersion}\n` : ""}` +
+            `${appVendor ? `Vendor: ${appVendor}\n` : ""}\n` +
+            "Use sandbox_psadt_build: scaffold the PSADT v4 template, copy the installer into Files\\, set app metadata and " +
+            "the install/uninstall commands, overlay the company branding template (useCompanyTemplate=true), test-install in " +
+            "the Sandbox, and wrap the result into a .intunewin (packageIntunewin=true). Report the package folder, applied " +
+            "branding, test result, and the .intunewin path.",
+        },
+      },
+    ],
+  }),
+);
+
 function bridgeHostPath(relativePath?: string | null): string | null {
   return toBridgeHostPath(relativePath);
 }
@@ -209,6 +257,28 @@ async function copyPackagesToHostFolder(packages: any[], outputHostFolder: strin
     copied.push({ ...pkg, hostPath: destination });
   }
   return copied;
+}
+
+// ---- PSADT (PowerShell App Deployment Toolkit) ----------------------------
+const PSADT_DEFAULT_VERSION = "4.1.8";
+// Company branding overlay: an explicit per-call host folder wins; otherwise the SANDBOX_PSADT_TEMPLATE
+// env var; otherwise the baked-in skeleton committed to the repo (assets/psadt-template).
+const psadtDefaultTemplateDir = path.join(projectRoot, "assets", "psadt-template");
+
+async function resolvePsadtTemplateHostFolder(
+  templateHostFolder: string | undefined,
+  useCompanyTemplate: boolean,
+): Promise<string | null> {
+  if (templateHostFolder) return templateHostFolder;
+  if (!useCompanyTemplate) return null;
+  const envDir = process.env.SANDBOX_PSADT_TEMPLATE;
+  const candidate = envDir && envDir.trim() ? envDir : psadtDefaultTemplateDir;
+  try {
+    await fsp.stat(candidate);
+    return candidate;
+  } catch {
+    return null;
+  }
 }
 
 // ---- Guide steps & auto-record -------------------------------------------
@@ -1751,6 +1821,180 @@ server.registerTool(
     return text({
       stagedSource: staged,
       packaging: packageResult,
+      copiedPackages,
+    });
+  },
+);
+
+server.registerTool(
+  "sandbox_psadt_prereqs",
+  {
+    title: "Resolve the PSAppDeployToolkit template",
+    description:
+      "Check for a cached PSAppDeployToolkit (PSADT) template in the Sandbox shared tools folder and, with " +
+      "ensureTool=true, download it from the official PSAppDeployToolkit GitHub release. Defaults to the v4 " +
+      "template at version 4.1.8. Downloads are pinned to the PSAppDeployToolkit/PSAppDeployToolkit release assets.",
+    inputSchema: {
+      version: z.string().default(PSADT_DEFAULT_VERSION).describe("PSADT release version, e.g. 4.1.8."),
+      frontend: z.enum(["v4", "v3"]).default("v4").describe("Template frontend: v4 (Invoke-AppDeployToolkit.ps1) or v3 (Deploy-Application.ps1)."),
+      ensureTool: z.boolean().default(true).describe("Download the template if it is not already cached."),
+      downloadUrl: z
+        .string()
+        .optional()
+        .describe("Optional override; must be a PSAppDeployToolkit GitHub release asset URL."),
+    },
+  },
+  async ({ version, frontend, ensureTool, downloadUrl }) =>
+    text(addBridgeHostPaths((await sendCommand("psadt_prereqs", { version, frontend, ensureTool, downloadUrl }, 180000)).data)),
+);
+
+server.registerTool(
+  "sandbox_psadt_build",
+  {
+    title: "Build a PSADT deployment package",
+    description:
+      "Fetch the PSAppDeployToolkit (PSADT) template, scaffold a deployment package, copy a host installer folder " +
+      "into Files\\, set app metadata, and inject install/uninstall commands (inferred from setupFile when not given). " +
+      "Optionally overlays a company branding template (logos/banners/config), test-installs the package in the Sandbox, " +
+      "and wraps it into a .intunewin. The branding template resolves from templateHostFolder, else the " +
+      "SANDBOX_PSADT_TEMPLATE env var, else the bundled default skeleton.",
+    inputSchema: {
+      appName: z.string().describe("Application name."),
+      appVersion: z.string().default("1.0.0").describe("Application version."),
+      appVendor: z.string().optional().describe("Application vendor/publisher."),
+      appArch: z.string().default("x64").describe("Application architecture (x64 / x86)."),
+      appLang: z.string().default("EN").describe("Application language code."),
+      sourceHostFolder: z.string().describe("Host folder containing the installer payload to copy into Files\\."),
+      setupFile: z.string().optional().describe("Setup file inside sourceHostFolder (filename); drives install-command inference."),
+      installCommand: z.string().optional().describe("Override the PSADT install task line (e.g. a Start-ADTProcess/Start-ADTMsiProcess call)."),
+      uninstallCommand: z.string().optional().describe("Override the PSADT uninstall task line."),
+      frontend: z.enum(["v4", "v3"]).default("v4").describe("PSADT template frontend."),
+      psadtVersion: z.string().default(PSADT_DEFAULT_VERSION).describe("PSADT release version to use."),
+      downloadUrl: z.string().optional().describe("Optional PSADT GitHub release asset URL override."),
+      useCompanyTemplate: z.boolean().default(true).describe("Overlay the company branding template (env default or bundled skeleton) when templateHostFolder is not given."),
+      templateHostFolder: z.string().optional().describe("Explicit host folder of branding/config files to overlay onto the package."),
+      detectionRule: z.any().optional().describe("Optional detection rule used during test-install verification and .intunewin packaging."),
+      testInstall: z.boolean().default(true).describe("Install (and uninstall) the built PSADT package inside the Sandbox to prove it works."),
+      testUninstall: z.boolean().default(true).describe("Also run the PSADT uninstall during the test."),
+      packageIntunewin: z.boolean().default(false).describe("Wrap the built package into a .intunewin (setupFile=Invoke-AppDeployToolkit.exe)."),
+      outputHostFolder: z.string().optional().describe("Optional host folder to copy the final .intunewin package(s) into."),
+      timeoutMs: z.number().int().positive().default(300000).describe("Build/download timeout in milliseconds."),
+      installTestTimeoutMs: z.number().int().positive().default(180000).describe("Per-step install/uninstall test timeout in milliseconds."),
+    },
+  },
+  async (args) => {
+    // Stage the installer payload into the bridge so the Sandbox can see it.
+    const stagedSource = await stageHostPath({ hostPath: args.sourceHostFolder, overwrite: true });
+
+    // Resolve and stage the company branding template, if any.
+    const templateHostFolder = await resolvePsadtTemplateHostFolder(args.templateHostFolder, args.useCompanyTemplate);
+    let stagedTemplate: any = null;
+    if (templateHostFolder) {
+      stagedTemplate = await stageHostPath({
+        hostPath: templateHostFolder,
+        destinationName: "psadt-template",
+        overwrite: true,
+      });
+    }
+
+    const build = addBridgeHostPaths(
+      (
+        await sendCommand(
+          "psadt_build",
+          {
+            appName: args.appName,
+            appVersion: args.appVersion,
+            appVendor: args.appVendor ?? "",
+            appArch: args.appArch,
+            appLang: args.appLang,
+            sourceFolder: stagedSource.guestPath,
+            setupFile: args.setupFile ?? "",
+            installCommand: args.installCommand ?? "",
+            uninstallCommand: args.uninstallCommand ?? "",
+            frontend: args.frontend,
+            version: args.psadtVersion,
+            downloadUrl: args.downloadUrl ?? "",
+            templateFolder: stagedTemplate?.guestPath ?? "",
+          },
+          Math.max(args.timeoutMs ?? 300000, 1000) + 30000,
+        )
+      ).data,
+    );
+
+    const packageGuestFolder: string | undefined = build?.packageFolder;
+    const setupFile: string = build?.setupFile ?? "Invoke-AppDeployToolkit.exe";
+    const installCommand: string = build?.intuneInstallCommand ?? `${setupFile} -DeploymentType Install -DeployMode Silent`;
+    const uninstallCommand: string = build?.intuneUninstallCommand ?? `${setupFile} -DeploymentType Uninstall -DeployMode Silent`;
+
+    let intunePackaging: any = null;
+    let copiedPackages: any[] = [];
+    let installTest: any = null;
+    let uninstallTest: any = null;
+
+    if (packageGuestFolder && args.packageIntunewin) {
+      // Reuse the proven Intune path: it test-installs (per testInstall) and produces the .intunewin.
+      intunePackaging = addBridgeHostPaths(
+        (
+          await sendCommand(
+            "intune_package",
+            {
+              sourceFolder: packageGuestFolder,
+              setupFile,
+              installCommand,
+              uninstallCommand,
+              detectionRule: args.detectionRule,
+              testInstall: args.testInstall,
+              installTestTimeoutMs: args.installTestTimeoutMs,
+              verifyDetection: !!args.detectionRule,
+              testUninstall: args.testUninstall,
+              uninstallTestTimeoutMs: args.installTestTimeoutMs,
+              ensureTool: true,
+              timeoutMs: args.timeoutMs,
+            },
+            Math.max(args.timeoutMs ?? 300000, args.installTestTimeoutMs ?? 180000, 1000) + 30000,
+          )
+        ).data,
+      );
+      if (args.outputHostFolder && intunePackaging?.packages?.length) {
+        copiedPackages = await copyPackagesToHostFolder(intunePackaging.packages, args.outputHostFolder);
+      }
+    } else if (packageGuestFolder && args.testInstall) {
+      // Standalone test-install (no .intunewin): run the PSADT launcher from the package folder.
+      const exePath = `${packageGuestFolder}\\${setupFile}`;
+      installTest = (
+        await sendCommand(
+          "installer_test",
+          {
+            command: `& '${exePath}' -DeploymentType Install -DeployMode Silent`,
+            workingDirectory: packageGuestFolder,
+            timeoutMs: args.installTestTimeoutMs,
+          },
+          Math.max(args.installTestTimeoutMs ?? 180000, 1000) + 30000,
+        )
+      ).data;
+      if (args.testUninstall) {
+        uninstallTest = (
+          await sendCommand(
+            "installer_test",
+            {
+              command: `& '${exePath}' -DeploymentType Uninstall -DeployMode Silent`,
+              workingDirectory: packageGuestFolder,
+              timeoutMs: args.installTestTimeoutMs,
+            },
+            Math.max(args.installTestTimeoutMs ?? 180000, 1000) + 30000,
+          )
+        ).data;
+      }
+    }
+
+    return text({
+      stagedSource,
+      stagedTemplate,
+      brandingTemplateHostFolder: templateHostFolder,
+      build,
+      installTest,
+      uninstallTest,
+      intunePackaging,
       copiedPackages,
     });
   },

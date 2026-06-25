@@ -1,6 +1,6 @@
 {
   "name": "sandbox-pilot",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Sandbox Pilot — an MCP server that lets an AI see, click, type, scroll, OCR and build guides inside a disposable Windows Sandbox.",
   "type": "module",
   "bin": {
@@ -10,6 +10,7 @@
     "dist",
     "host",
     "guest",
+    "assets/psadt-template",
     "bridge/BootstrapWinget.ps1",
     "bridge/CheckAdobeStatus.ps1",
     "bridge/InstallTesseract.ps1",
